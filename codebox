@@ -23,11 +23,18 @@
 # Usage: codebox [OPTIONS] [DIR] [-- CLAUDE_ARGS...]
 #
 # Options:
-#   -r, --rebuild   Force rebuild of the Docker image(s)
-#   -h, --help      Show this help
+#   -r, --rebuild        Force rebuild of the Docker image(s)
+#   --no-credentials     Do not mount ~/.claude.json; requires ANTHROPIC_API_KEY
+#                        for auth; eliminates OAuth token exposure
+#   -h, --help           Show this help
 #
 # DIR defaults to the current working directory.
 # CLAUDE_ARGS are passed through to `claude`.
+#
+# Credential mounts:
+#   ~/.claude and ~/.claude.json are mounted read-write by default (Claude Code
+#   requires write access to both on startup). Use --no-credentials with
+#   ANTHROPIC_API_KEY to skip the ~/.claude.json mount entirely.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the
 # base image to add project-specific dependencies. It should start with:
@@ -38,9 +45,10 @@ set -euo pipefail
 
 IMAGE_NAME="codebox"
 REBUILD=false
+NO_CREDS=false
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -48,8 +56,9 @@ usage() {
 AFTER_DASHDASH=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -r|--rebuild) REBUILD=true; shift ;;
-        -h|--help)    usage ;;
+        -r|--rebuild)        REBUILD=true; shift ;;
+        --no-credentials)    NO_CREDS=true; shift ;;
+        -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
         -*)           echo "Unknown option: $1" >&2; exit 1 ;;
         *)            break ;;
@@ -121,19 +130,17 @@ for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR; do
     fi
 done
 
-# Mount ~/.claude for saved preferences/auth; treat it as read-write so login
-# state persists, but the container still can't touch anything else on the host.
 CLAUDE_HOST_DIR="${HOME}/.claude"
 mkdir -p "$CLAUDE_HOST_DIR"
-
-EXTRA_MOUNTS=()
-[[ -f "${HOME}/.claude.json" ]] && EXTRA_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+CRED_MOUNTS=(-v "$CLAUDE_HOST_DIR:/home/sandbox/.claude")
+if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
+    CRED_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+fi
 
 exec docker run --rm -it \
     --user "$(id -u):$(id -g)" \
     -v "$TARGET_DIR:$TARGET_DIR" \
-    -v "$CLAUDE_HOST_DIR:/home/sandbox/.claude" \
-    "${EXTRA_MOUNTS[@]}" \
+    "${CRED_MOUNTS[@]}" \
     -w "$TARGET_DIR" \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \

@@ -29,6 +29,7 @@ codebox [OPTIONS] [DIR] [-- CLAUDE_ARGS...]
 | Flag | Description |
 |------|-------------|
 | `-r`, `--rebuild` | Force rebuild of the Docker image(s) |
+| `--no-credentials` | Skip mounting `~/.claude.json`; requires `ANTHROPIC_API_KEY` |
 | `-h`, `--help` | Show help |
 
 **Examples:**
@@ -43,6 +44,8 @@ codebox ~/src/myproject
 # Pass arguments to claude
 codebox ~/src/myproject -- --model claude-opus-4-8
 
+# Maximum isolation: no OAuth token exposed, auth via API key
+ANTHROPIC_API_KEY=sk-... codebox --no-credentials ~/src/myproject
 ```
 
 ## How it works
@@ -50,6 +53,8 @@ codebox ~/src/myproject -- --model claude-opus-4-8
 The first run builds a base Docker image (`codebox`) from the bundled `Dockerfile`. The image installs Claude Code on top of `debian:trixie-slim`.
 
 Your `~/.claude` directory and `~/.claude.json` are mounted into the container so login state and preferences persist across runs. The container runs as your host user (`uid:gid`), so files written inside the container are owned by you.
+
+To avoid exposing your OAuth tokens to the container, pass `--no-credentials` and authenticate via `ANTHROPIC_API_KEY` instead.
 
 ## Project-specific images
 
