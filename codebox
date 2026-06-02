@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Run Claude Code in an isolated Docker container.
+# Usage: codebox [OPTIONS] [DIR] [-- CLAUDE_ARGS...]
+#
+# Options:
+#   -r, --rebuild   Force rebuild of the Docker image(s)
+#   -h, --help      Show this help
+#
+# DIR defaults to the current working directory.
+# CLAUDE_ARGS are passed through to `claude`.
+#
+# If DIR contains a Dockerfile.codebox, it is built on top of the
+# base image to add project-specific dependencies. It should start with:
+#   FROM codebox
+
+set -euo pipefail
+
+IMAGE_NAME="codebox"
+REBUILD=false
+
+usage() {
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# Parse options
+AFTER_DASHDASH=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--rebuild) REBUILD=true; shift ;;
+        -h|--help)    usage ;;
+        --)           shift; AFTER_DASHDASH=true; break ;;
+        -*)           echo "Unknown option: $1" >&2; exit 1 ;;
+        *)            break ;;
+    esac
+done
+
+# Only consume a DIR argument if -- was not used (otherwise the first
+# claude arg would be mistaken for the directory).
+if ! $AFTER_DASHDASH; then
+    TARGET_DIR="${1:-$PWD}"
+    shift 2>/dev/null || true
+fi
+TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "error: directory not found: $TARGET_DIR" >&2
+    exit 1
+fi
+
+# Build base image if missing or rebuild requested
+if $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Building $IMAGE_NAME..." >&2
+    docker build -t "$IMAGE_NAME" - <<'DOCKERFILE'
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENTRYPOINT ["claude"]
+DOCKERFILE
+fi
+
+# Check for a project-specific Dockerfile
+PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+RUN_IMAGE="$IMAGE_NAME"
+
+if [[ -f "$PROJECT_DOCKERFILE" ]]; then
+    DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
+    PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
+    DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
+    EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
+        --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
+    if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
+        echo "Building project image for $TARGET_DIR..." >&2
+        docker build \
+            --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
+            -t "$PROJECT_IMAGE" \
+            -f "$PROJECT_DOCKERFILE" \
+            "$TARGET_DIR"
+    fi
+    RUN_IMAGE="$PROJECT_IMAGE"
+fi
+
+# Collect env vars to forward
+ENV_ARGS=()
+for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR; do
+    if [[ -n "${!var:-}" ]]; then
+        ENV_ARGS+=(-e "$var=${!var}")
+    fi
+done
+
+# Mount ~/.claude for saved preferences/auth; treat it as read-write so login
+# state persists, but the container still can't touch anything else on the host.
+CLAUDE_HOST_DIR="${HOME}/.claude"
+mkdir -p "$CLAUDE_HOST_DIR"
+
+EXTRA_MOUNTS=()
+[[ -f "${HOME}/.claude.json" ]] && EXTRA_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+
+exec docker run --rm -it \
+    --user "$(id -u):$(id -g)" \
+    -v "$TARGET_DIR:$TARGET_DIR" \
+    -v "$CLAUDE_HOST_DIR:/home/sandbox/.claude" \
+    "${EXTRA_MOUNTS[@]}" \
+    -w "$TARGET_DIR" \
+    -e HOME=/home/sandbox \
+    "${ENV_ARGS[@]}" \
+    "$RUN_IMAGE" \
+    "$@"
