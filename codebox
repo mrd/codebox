@@ -137,7 +137,15 @@ if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
     CRED_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
 fi
 
-exec docker run --rm -it \
+# Unique name so we can detect a Ctrl-Z detach and show reattach instructions.
+CONTAINER_NAME="codebox-$(id -u)-$$"
+
+# --detach-keys ctrl-z: Ctrl-Z detaches cleanly (restores terminal) instead of
+# being forwarded to the container where it would stop claude and leave the host
+# terminal stuck in raw mode.
+docker run --rm -it \
+    --name "$CONTAINER_NAME" \
+    --detach-keys "ctrl-z" \
     --user "$(id -u):$(id -g)" \
     -v "$TARGET_DIR:$TARGET_DIR" \
     "${CRED_MOUNTS[@]}" \
@@ -146,3 +154,9 @@ exec docker run --rm -it \
     "${ENV_ARGS[@]}" \
     "$RUN_IMAGE" \
     "$@"
+
+# If the container is still running, the user detached with Ctrl-Z.
+if docker container inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
+    printf '\nSession suspended. To resume:\n  docker attach --detach-keys ctrl-z %s\n' \
+        "$CONTAINER_NAME" >&2
+fi
