@@ -28,6 +28,8 @@
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
+#   --no-dockerfile      Ignore the directory's Dockerfile.codebox and run the
+#                        base image instead
 #   --trust              Trust this directory's Dockerfile.codebox without
 #                        prompting (needed for non-interactive use)
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
@@ -75,6 +77,7 @@ REBUILD=false
 NO_CACHE=false
 NO_CREDS=false
 NO_GITCONFIG=false
+NO_DOCKERFILE=false
 USE_OPENCODE=false
 TRUST=false
 
@@ -91,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
+        --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         -h|--help)           usage ;;
@@ -168,11 +172,11 @@ ENTRYPOINT ["opencode"]
 DOCKERFILE
 fi
 
-# Check for a project-specific Dockerfile
+# Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
 PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
 RUN_IMAGE="$IMAGE_NAME"
 
-if [[ -f "$PROJECT_DOCKERFILE" ]]; then
+if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
     PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
     DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"

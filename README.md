@@ -30,6 +30,7 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 |------|-------------|
 | `-r`, `--rebuild` | Force rebuild of the Docker image(s) |
 | `--no-credentials` | Skip mounting credential/config directories; requires `ANTHROPIC_API_KEY` |
+| `--no-dockerfile` | Ignore the project's `Dockerfile.codebox` and run the base image instead |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
 | `-h`, `--help` | Show help |
 
@@ -77,7 +78,7 @@ FROM codebox          # for Claude Code (default)
 FROM codebox-opencode # for --opencode
 ```
 
-The project image is rebuilt automatically when the `Dockerfile.codebox` changes (detected by SHA-256). To force a rebuild, pass `-r`.
+The project image is rebuilt automatically when the `Dockerfile.codebox` changes (detected by SHA-256). To force a rebuild, pass `-r`. To skip the project image entirely and run the base image, pass `--no-dockerfile`.
 
 **Example** — adding Node.js to a project:
 
