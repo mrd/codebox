@@ -47,6 +47,10 @@
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
 #   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
 #
+# Job control: Ctrl-Z suspends the session and `fg` resumes it, like any other
+#   job-control program. (Under the hood Ctrl-Z detaches from the container and
+#   `fg` re-attaches; the container keeps running while suspended.)
+#
 # Environment: If the target directory contains a .env.codebox file, each
 #   KEY=VALUE line is forwarded as an environment variable to the container.
 #   Sensitive keys (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
@@ -289,12 +293,26 @@ if ! $NO_GITCONFIG && [[ -f "${HOME}/.gitconfig" ]]; then
     GITCONFIG_MOUNTS=(-v "${HOME}/.gitconfig:/home/sandbox/.gitconfig:ro")
 fi
 
-# Unique name so we can detect a Ctrl-Z detach and show reattach instructions.
+# Unique name so a Ctrl-Z detach can be reattached.
 CONTAINER_NAME="codebox-$(id -u)-$$"
 
-# --detach-keys ctrl-z: Ctrl-Z detaches cleanly (restores terminal) instead of
-# being forwarded to the container where it would stop claude and leave the host
-# terminal stuck in raw mode.
+# Ctrl-Z / fg job control.
+#
+# Goal: Ctrl-Z suspends the session and `fg` resumes it, like a normal program.
+# This can't be done by forwarding the signal: `docker run -it` holds the host
+# terminal in raw mode (ISIG cleared), so Ctrl-Z reaches the container as raw
+# byte 0x1a and never generates SIGTSTP on the host -- the host shell never sees
+# a stopped job, so there is nothing for `fg` to resume. (And the forwarded byte
+# just stops claude *inside* the container while docker keeps the terminal.)
+#
+# So we build it on top of `docker attach` instead. Map Ctrl-Z to Docker's
+# --detach-keys sequence: on Ctrl-Z the docker run/attach process exits cleanly
+# (restoring the terminal) while the container keeps running. We then stop *this
+# script* with SIGTSTP, so it becomes a stopped job in the host shell; when the
+# user runs `fg` the script continues and re-attaches to the still-running
+# container. Repeat for as many Ctrl-Z / fg cycles as the user likes.
+container_running() { docker container inspect "$CONTAINER_NAME" &>/dev/null; }
+
 docker run --rm -it \
     --name "$CONTAINER_NAME" \
     --detach-keys "ctrl-z" \
@@ -308,10 +326,13 @@ docker run --rm -it \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \
     "$RUN_IMAGE" \
-    "$@"
+    "$@" || true
 
-# If the container is still running, the user detached with Ctrl-Z.
-if docker container inspect "$CONTAINER_NAME" &>/dev/null 2>&1; then
-    printf '\nSession suspended. To resume:\n  docker attach --detach-keys ctrl-z %s\n' \
-        "$CONTAINER_NAME" >&2
-fi
+# As long as the container is still alive after the foreground process exited,
+# the user detached with Ctrl-Z: suspend ourselves (the shell reports a stopped
+# job) and reattach when `fg` continues us.
+while container_running; do
+    kill -TSTP $$
+    container_running || break
+    docker attach --detach-keys ctrl-z "$CONTAINER_NAME" || true
+done
