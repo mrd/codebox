@@ -19,26 +19,28 @@
 #
 ################################################################################
 #
-# Run Claude Code in an isolated Docker container.
-# Usage: codebox [OPTIONS] [DIR] [-- CLAUDE_ARGS...]
+# Run Claude Code or OpenCode in an isolated Docker container.
+# Usage: codebox [OPTIONS] [DIR] [-- ARGS...]
 #
 # Options:
 #   -r, --rebuild        Force rebuild of the Docker image(s)
-#   --no-credentials     Do not mount ~/.claude.json; requires ANTHROPIC_API_KEY
-#                        for auth; eliminates OAuth token exposure
+#   --no-credentials     Do not mount credential/config directories; requires
+#                        ANTHROPIC_API_KEY for auth
+#   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   -h, --help           Show this help
 #
 # DIR defaults to the current working directory.
-# CLAUDE_ARGS are passed through to `claude`.
+# ARGS are passed through to `claude` or `opencode`.
 #
-# Credential mounts:
-#   ~/.claude and ~/.claude.json are mounted read-write by default (Claude Code
-#   requires write access to both on startup). Use --no-credentials with
-#   ANTHROPIC_API_KEY to skip the ~/.claude.json mount entirely.
+# Credential mounts (default):
+#   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
+#   OpenCode:    ~/.config/opencode mounted read-write.
+#   Use --no-credentials to skip all credential mounts (requires ANTHROPIC_API_KEY).
 #
-# If DIR contains a Dockerfile.codebox, it is built on top of the
-# base image to add project-specific dependencies. It should start with:
-#   FROM codebox
+# If DIR contains a Dockerfile.codebox, it is built on top of the base image
+# to add project-specific dependencies. It should start with:
+#   FROM codebox          (Claude Code, the default)
+#   FROM codebox-opencode (with --opencode)
 ################################################################################
 
 set -euo pipefail
@@ -46,6 +48,7 @@ set -euo pipefail
 IMAGE_NAME="codebox"
 REBUILD=false
 NO_CREDS=false
+USE_OPENCODE=false
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -58,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rebuild)        REBUILD=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
+        --opencode)          USE_OPENCODE=true; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
         -*)           echo "Unknown option: $1" >&2; exit 1 ;;
@@ -73,13 +77,17 @@ if ! $AFTER_DASHDASH; then
 fi
 TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
 
+if $USE_OPENCODE; then
+    IMAGE_NAME="codebox-opencode"
+fi
+
 if [[ ! -d "$TARGET_DIR" ]]; then
     echo "error: directory not found: $TARGET_DIR" >&2
     exit 1
 fi
 
 # Build base image if missing or rebuild requested
-if $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+if ! $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
     echo "Building $IMAGE_NAME..." >&2
     docker build -t "$IMAGE_NAME" - <<'DOCKERFILE'
 FROM debian:trixie-slim
@@ -98,6 +106,28 @@ ENV PATH="/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 ENTRYPOINT ["claude"]
+DOCKERFILE
+fi
+
+if $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
+    echo "Building $IMAGE_NAME..." >&2
+    docker build -t "$IMAGE_NAME" - <<'DOCKERFILE'
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://opencode.ai/install | bash
+
+ENTRYPOINT ["opencode"]
 DOCKERFILE
 fi
 
@@ -124,17 +154,30 @@ fi
 
 # Collect env vars to forward
 ENV_ARGS=()
-for var in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR; do
+ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL)
+if ! $USE_OPENCODE; then
+    ENV_VARS+=(CLAUDE_CONFIG_DIR)
+fi
+for var in "${ENV_VARS[@]}"; do
     if [[ -n "${!var:-}" ]]; then
         ENV_ARGS+=(-e "$var=${!var}")
     fi
 done
 
-CLAUDE_HOST_DIR="${HOME}/.claude"
-mkdir -p "$CLAUDE_HOST_DIR"
-CRED_MOUNTS=(-v "$CLAUDE_HOST_DIR:/home/sandbox/.claude")
-if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
-    CRED_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+if $USE_OPENCODE; then
+    CRED_MOUNTS=()
+    if ! $NO_CREDS; then
+        OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode"
+        mkdir -p "$OPENCODE_CONFIG_HOST_DIR"
+        CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode")
+    fi
+else
+    CLAUDE_HOST_DIR="${HOME}/.claude"
+    mkdir -p "$CLAUDE_HOST_DIR"
+    CRED_MOUNTS=(-v "$CLAUDE_HOST_DIR:/home/sandbox/.claude")
+    if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
+        CRED_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+    fi
 fi
 
 # Unique name so we can detect a Ctrl-Z detach and show reattach instructions.
