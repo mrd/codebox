@@ -37,13 +37,19 @@
 # Credential mounts (default):
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
 #   OpenCode:    ~/.config/opencode mounted read-write.
-#   Use --no-credentials to skip all credential mounts (requires ANTHROPIC_API_KEY).
+#   With --no-credentials a dedicated sandbox config dir is mounted instead of
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox), so no
+#   host login state or host-executed hooks are exposed. Auth via
+#   ANTHROPIC_API_KEY in that case.
 #
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
 #   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
 #
 # Environment: If the target directory contains a .env.codebox file, each
 #   KEY=VALUE line is forwarded as an environment variable to the container.
+#   Sensitive keys (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
+#   CLAUDE_CONFIG_DIR) are refused since .env.codebox may come from an untrusted
+#   target directory; forwarded keys are printed before the container starts.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It should start with:
@@ -183,7 +189,14 @@ for var in "${ENV_VARS[@]}"; do
     fi
 done
 
-# Load .env.codebox from the target directory if present
+# Load .env.codebox from the target directory if present.
+#
+# .env.codebox lives inside the (potentially untrusted) target directory, so a
+# cloned repo could ship one. Refuse keys that would redirect API traffic or
+# relocate the config dir — e.g. ANTHROPIC_BASE_URL pointing at an attacker host
+# would exfiltrate the API key / OAuth token in request headers. Forwarded keys
+# are printed so they are visible before the container starts.
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR)
 ENV_FILE="$TARGET_DIR/.env.codebox"
 if [[ -f "$ENV_FILE" ]]; then
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
@@ -192,19 +205,42 @@ if [[ -f "$ENV_FILE" ]]; then
         [[ -z "$key" || "$key" =~ ^# ]] && continue
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
+        blocked=false
+        for b in "${ENV_BLOCKLIST[@]}"; do
+            [[ "$key" == "$b" ]] && { blocked=true; break; }
+        done
+        if $blocked; then
+            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
+            continue
+        fi
+        echo "forwarding env from .env.codebox: $key" >&2
         ENV_ARGS+=(-e "${key}=${value}")
     done < "$ENV_FILE"
 fi
 
+# Credential/config mounts.
+#
+# With --no-credentials we mount a *dedicated* sandbox config dir rather than the
+# host's real one. The host config dir is more than credentials: on Linux the
+# OAuth refresh token lives in ~/.claude/.credentials.json, and ~/.claude both
+# stores settings.json (which can define hooks that run on the host) and is
+# mounted read-write. Pointing the container at a separate dir keeps cross-run
+# persistence for the sandbox without exposing host login state or letting the
+# sandbox write host-executed hooks. Auth is then expected via ANTHROPIC_API_KEY.
 if $USE_OPENCODE; then
-    CRED_MOUNTS=()
-    if ! $NO_CREDS; then
+    if $NO_CREDS; then
+        OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode-codebox"
+    else
         OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode"
-        mkdir -p "$OPENCODE_CONFIG_HOST_DIR"
-        CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode")
     fi
+    mkdir -p "$OPENCODE_CONFIG_HOST_DIR"
+    CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode")
 else
-    CLAUDE_HOST_DIR="${HOME}/.claude"
+    if $NO_CREDS; then
+        CLAUDE_HOST_DIR="${HOME}/.claude-codebox"
+    else
+        CLAUDE_HOST_DIR="${HOME}/.claude"
+    fi
     mkdir -p "$CLAUDE_HOST_DIR"
     CRED_MOUNTS=(-v "$CLAUDE_HOST_DIR:/home/sandbox/.claude")
     if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
@@ -227,6 +263,8 @@ CONTAINER_NAME="codebox-$(id -u)-$$"
 docker run --rm -it \
     --name "$CONTAINER_NAME" \
     --detach-keys "ctrl-z" \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
     --user "$(id -u):$(id -g)" \
     -v "$TARGET_DIR:$TARGET_DIR" \
     "${CRED_MOUNTS[@]}" \
