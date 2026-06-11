@@ -28,6 +28,8 @@
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
+#   --trust              Trust this directory's Dockerfile.codebox without
+#                        prompting (needed for non-interactive use)
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   -h, --help           Show this help
 #
@@ -55,6 +57,11 @@
 # to add project-specific dependencies. It should start with:
 #   FROM codebox          (Claude Code, the default)
 #   FROM codebox-opencode (with --opencode)
+# Building it runs arbitrary code and the resulting image controls the
+# container, so codebox prompts for confirmation before building a
+# Dockerfile.codebox from a directory you have not already trusted. Trust is
+# remembered per (directory, file SHA); editing the file re-prompts. Use
+# --trust to skip the prompt (e.g. in scripts).
 ################################################################################
 
 set -euo pipefail
@@ -65,6 +72,7 @@ NO_CACHE=false
 NO_CREDS=false
 NO_GITCONFIG=false
 USE_OPENCODE=false
+TRUST=false
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -79,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
+        --trust)             TRUST=true; shift ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
@@ -163,6 +172,32 @@ if [[ -f "$PROJECT_DOCKERFILE" ]]; then
     DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
     PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
     DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
+
+    # A Dockerfile.codebox is arbitrary code run at build time (and controls the
+    # container's ENTRYPOINT, so it can read the mounted credentials). Since the
+    # target directory may be untrusted (e.g. a cloned repo), require explicit
+    # trust before building one. Trust is remembered per (directory, SHA) so an
+    # unchanged Dockerfile is not re-prompted; editing it re-prompts.
+    TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+    TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
+    if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
+        echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
+        echo "  It will be built and run on your machine; it can execute arbitrary" >&2
+        echo "  code and read mounted credentials. Only trust directories you control." >&2
+        if [[ ! -t 0 ]]; then
+            echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
+            echo "       Re-run with --trust if you trust this directory." >&2
+            exit 1
+        fi
+        read -r -p "Build and run it? [y/N] " ans
+        if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+            echo "Aborted." >&2
+            exit 1
+        fi
+    fi
+    mkdir -p "$(dirname "$TRUST_STORE")"
+    grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
+
     EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
         --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
     if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
