@@ -23,7 +23,8 @@
 # Usage: codebox [OPTIONS] [DIR] [-- ARGS...]
 #
 # Options:
-#   -r, --rebuild        Force rebuild of the Docker image(s)
+#   -r, --rebuild        Rebuild the Docker image(s) (uses layer cache)
+#   -R, --force-rebuild  Force rebuild the Docker image(s) ignoring cache
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
@@ -54,6 +55,7 @@ set -euo pipefail
 
 IMAGE_NAME="codebox"
 REBUILD=false
+NO_CACHE=false
 NO_CREDS=false
 NO_GITCONFIG=false
 USE_OPENCODE=false
@@ -68,6 +70,7 @@ AFTER_DASHDASH=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rebuild)        REBUILD=true; shift ;;
+        -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --opencode)          USE_OPENCODE=true; shift ;;
@@ -95,10 +98,16 @@ if [[ ! -d "$TARGET_DIR" ]]; then
     exit 1
 fi
 
+# Build cache flag (empty unless cache-busting was requested). Using an array
+# avoids the ${NO_CACHE:+...} trap where the literal string "false" is non-empty
+# and would expand to --no-cache.
+CACHE_ARG=()
+$NO_CACHE && CACHE_ARG=(--no-cache)
+
 # Build base image if missing or rebuild requested
 if ! $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
     echo "Building $IMAGE_NAME..." >&2
-    docker build -t "$IMAGE_NAME" - <<'DOCKERFILE'
+    docker build "${CACHE_ARG[@]}" -t "$IMAGE_NAME" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -120,7 +129,7 @@ fi
 
 if $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
     echo "Building $IMAGE_NAME..." >&2
-    docker build -t "$IMAGE_NAME" - <<'DOCKERFILE'
+    docker build "${CACHE_ARG[@]}" -t "$IMAGE_NAME" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -153,6 +162,7 @@ if [[ -f "$PROJECT_DOCKERFILE" ]]; then
     if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
         echo "Building project image for $TARGET_DIR..." >&2
         docker build \
+            "${CACHE_ARG[@]}" \
             --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
             -t "$PROJECT_IMAGE" \
             -f "$PROJECT_DOCKERFILE" \
