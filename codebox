@@ -26,6 +26,7 @@
 #   -r, --rebuild        Force rebuild of the Docker image(s)
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
+#   --no-gitconfig       Do not mount host ~/.gitconfig into the container
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   -h, --help           Show this help
 #
@@ -36,6 +37,12 @@
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
 #   OpenCode:    ~/.config/opencode mounted read-write.
 #   Use --no-credentials to skip all credential mounts (requires ANTHROPIC_API_KEY).
+#
+# Git config: ~/.gitconfig is mounted read-only into the container so that git
+#   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
+#
+# Environment: If the target directory contains a .env.codebox file, each
+#   KEY=VALUE line is forwarded as an environment variable to the container.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It should start with:
@@ -48,6 +55,7 @@ set -euo pipefail
 IMAGE_NAME="codebox"
 REBUILD=false
 NO_CREDS=false
+NO_GITCONFIG=false
 USE_OPENCODE=false
 
 usage() {
@@ -61,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rebuild)        REBUILD=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
+        --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
@@ -164,6 +173,19 @@ for var in "${ENV_VARS[@]}"; do
     fi
 done
 
+# Load .env.codebox from the target directory if present
+ENV_FILE="$TARGET_DIR/.env.codebox"
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        ENV_ARGS+=(-e "${key}=${value}")
+    done < "$ENV_FILE"
+fi
+
 if $USE_OPENCODE; then
     CRED_MOUNTS=()
     if ! $NO_CREDS; then
@@ -180,6 +202,12 @@ else
     fi
 fi
 
+# Mount host ~/.gitconfig read-only inside the container (opt-out via --no-gitconfig)
+GITCONFIG_MOUNTS=()
+if ! $NO_GITCONFIG && [[ -f "${HOME}/.gitconfig" ]]; then
+    GITCONFIG_MOUNTS=(-v "${HOME}/.gitconfig:/home/sandbox/.gitconfig:ro")
+fi
+
 # Unique name so we can detect a Ctrl-Z detach and show reattach instructions.
 CONTAINER_NAME="codebox-$(id -u)-$$"
 
@@ -192,6 +220,7 @@ docker run --rm -it \
     --user "$(id -u):$(id -g)" \
     -v "$TARGET_DIR:$TARGET_DIR" \
     "${CRED_MOUNTS[@]}" \
+    "${GITCONFIG_MOUNTS[@]}" \
     -w "$TARGET_DIR" \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \
