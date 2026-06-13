@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+################################################################################
+#
+# codebox-web - Run OpenCode web server in a Docker container with Tailscale,
+#               accessible from your tailnet.
+# Copyright (C) 2026 Matthew Danish
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+################################################################################
+#
+# Usage: codebox-web [OPTIONS] [DIR]
+#
+# Run OpenCode web in an isolated Docker container, accessible via Tailscale.
+# Your project directory is mounted read-write into the container.
+#
+# Options:
+#   -r, --rebuild         Rebuild the base Docker image (uses layer cache)
+#   -R, --force-rebuild   Rebuild the base image ignoring cache
+#   -d, --detach          Run in background (default: foreground)
+#   --port PORT           Port for opencode web (default: 3000)
+#   --stop                Stop the server and remove containers
+#   --logs                Follow logs of a running server
+#   --status              Show Tailscale IP and container status
+#   --no-credentials      Do not mount host opencode config; use
+#                         ANTHROPIC_API_KEY instead
+#   -h, --help            Show this help
+#
+# DIR defaults to the current working directory.
+#
+# Environment variables:
+#   TS_AUTH_KEY           Tailscale auth key (get one at
+#                         https://login.tailscale.com/admin/settings/authkeys)
+#   ANTHROPIC_API_KEY     Anthropic API key (required without --no-credentials
+#                         if not already logged in via opencode config)
+#
+# Examples:
+#   codebox-web                           # Run in current dir (foreground)
+#   codebox-web -d ~/src/myproject        # Run in background
+#   TS_AUTH_KEY=tskey-... codebox-web -d  # Run with Tailscale auth key
+#   codebox-web --stop                    # Stop the server
+#   codebox-web --logs                    # Follow logs
+################################################################################
+
+set -euo pipefail
+
+NAME="$(basename "$0")"
+
+usage() {
+    sed -n '/^# Usage:/,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+REBUILD=false
+NO_CACHE=false
+DETACH=false
+PORT=3000
+ACTION="up"
+NO_CREDS=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--rebuild)        REBUILD=true; shift ;;
+        -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
+        -d|--detach)         DETACH=true; shift ;;
+        --port)              PORT="$2"; shift 2 ;;
+        --stop)              ACTION="stop"; shift ;;
+        --logs)              ACTION="logs"; shift ;;
+        --status)            ACTION="status"; shift ;;
+        --no-credentials)    NO_CREDS=true; shift ;;
+        -h|--help)           usage ;;
+        --)                  shift; break ;;
+        -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
+        *)                   TARGET_DIR="$1"; shift ;;
+    esac
+done
+
+TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "error: directory not found: $TARGET_DIR" >&2
+    exit 1
+fi
+
+# Deterministic suffix per target directory (for compose project + volume names)
+SUFFIX="$(echo "$TARGET_DIR" | sha256sum | cut -c1-8)"
+PROJECT="codebox-web-${SUFFIX}"
+COMPOSE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/compose-web"
+
+command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 1; }
+
+CACHE_ARG=()
+$NO_CACHE && CACHE_ARG=(--no-cache)
+
+ensure_base_image() {
+    if ! $REBUILD && docker image inspect codebox-opencode &>/dev/null; then
+        return 0
+    fi
+    echo "Building codebox-opencode base image..." >&2
+    docker build "${CACHE_ARG[@]}" -t codebox-opencode - <<'DOCKERFILE'
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates xdg-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
+RUN curl -fsSL https://opencode.ai/install | bash
+ENTRYPOINT ["opencode"]
+DOCKERFILE
+}
+
+generate_compose() {
+    mkdir -p "$COMPOSE_DIR"
+
+    if $NO_CREDS; then
+        CONFIG_VOLUME="opencode-config-codebox"
+    else
+        CONFIG_VOLUME="opencode-config"
+    fi
+
+    cat > "$COMPOSE_DIR/docker-compose.yml" <<EOF
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: opencode-web-${SUFFIX}
+    environment:
+      TS_AUTH_KEY: \${TS_AUTH_KEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: \${TS_EXTRA_ARGS:-}
+    volumes:
+      - ts-data-${SUFFIX}:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+
+  opencode:
+    image: codebox-opencode
+    network_mode: "service:tailscale"
+    user: "$(id -u):$(id -g)"
+    environment:
+      HOME: /home/sandbox
+      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}
+      BROWSER: /bin/true
+    volumes:
+      - "${TARGET_DIR}:${TARGET_DIR}"
+EOF
+
+    if ! $NO_CREDS; then
+        OPENCODE_CONFIG_HOST="${HOME}/.config/opencode"
+        mkdir -p "$OPENCODE_CONFIG_HOST"
+        echo "      - ${OPENCODE_CONFIG_HOST}:/home/sandbox/.config/opencode" >> "$COMPOSE_DIR/docker-compose.yml"
+    fi
+
+    cat >> "$COMPOSE_DIR/docker-compose.yml" <<EOF
+    working_dir: "${TARGET_DIR}"
+    command: ["web", "--hostname", "0.0.0.0", "--port", "${PORT}"]
+    depends_on:
+      - tailscale
+
+volumes:
+  ts-data-${SUFFIX}:
+EOF
+}
+
+ensure_compose_plugin() {
+    docker compose version &>/dev/null && return 0
+    echo "error: 'docker compose' plugin not available" >&2
+    echo "Install Docker Compose v2: https://docs.docker.com/compose/install/" >&2
+    exit 1
+}
+
+case "$ACTION" in
+    up)
+        ensure_compose_plugin
+        ensure_base_image
+        generate_compose
+
+        cd "$COMPOSE_DIR"
+        if $DETACH; then
+            docker compose -p "$PROJECT" up -d
+        else
+            docker compose -p "$PROJECT" up
+        fi
+
+        # Print access info if running detached
+        if $DETACH; then
+            echo "Waiting for Tailscale..." >&2
+            for i in $(seq 1 15); do
+                IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+                if [[ -n "$IP" ]]; then
+                    echo "OpenCode Web: http://${IP}:${PORT}" >&2
+                    break
+                fi
+                sleep 1
+            done
+            if [[ -z "${IP:-}" ]]; then
+                echo "Tailscale may need authentication." >&2
+                echo "Check 'codebox-web --logs' for the auth URL." >&2
+                echo "Or set TS_AUTH_KEY=tskey-... and restart." >&2
+            fi
+        fi
+        ;;
+
+    stop)
+        ensure_compose_plugin
+        if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
+            cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" down
+        else
+            echo "Nothing running for $TARGET_DIR" >&2
+        fi
+        ;;
+
+    logs)
+        ensure_compose_plugin
+        cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" logs -f
+        ;;
+
+    status)
+        ensure_compose_plugin
+        cd "$COMPOSE_DIR" 2>/dev/null || true
+        echo "Project: $PROJECT" >&2
+        docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
+
+        IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+        if [[ -n "$IP" ]]; then
+            echo "Tailscale IP: $IP" >&2
+            echo "URL: http://${IP}:${PORT}" >&2
+        fi
+        ;;
+esac
