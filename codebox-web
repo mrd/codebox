@@ -35,9 +35,15 @@
 #   --status              Show Tailscale IP and container status
 #   --no-credentials      Do not mount host opencode config; use
 #                         ANTHROPIC_API_KEY instead
+#   --no-dockerfile       Ignore Dockerfile.codebox and use base image
+#   --trust               Trust Dockerfile.codebox without prompting
 #   -h, --help            Show this help
 #
 # DIR defaults to the current working directory.
+#
+# If DIR contains a Dockerfile.codebox, it is built on top of the base image
+# to add project-specific dependencies. It should start with:
+#   FROM codebox-opencode
 #
 # Environment variables:
 #   TS_AUTH_KEY           Tailscale auth key (get one at
@@ -68,6 +74,8 @@ DETACH=false
 PORT=3000
 ACTION="up"
 NO_CREDS=false
+NO_DOCKERFILE=false
+TRUST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -79,6 +87,8 @@ while [[ $# -gt 0 ]]; do
         --logs)              ACTION="logs"; shift ;;
         --status)            ACTION="status"; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
+        --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
+        --trust)             TRUST=true; shift ;;
         -h|--help)           usage ;;
         --)                  shift; break ;;
         -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -102,6 +112,7 @@ command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 
 
 CACHE_ARG=()
 $NO_CACHE && CACHE_ARG=(--no-cache)
+RUN_IMAGE="codebox-opencode"
 
 ensure_base_image() {
     if ! $REBUILD && docker image inspect codebox-opencode &>/dev/null; then
@@ -149,7 +160,7 @@ services:
     restart: unless-stopped
 
   opencode:
-    image: codebox-opencode
+    image: ${RUN_IMAGE}
     network_mode: "service:tailscale"
     user: "$(id -u):$(id -g)"
     environment:
@@ -185,61 +196,103 @@ ensure_compose_plugin() {
 }
 
 case "$ACTION" in
-    up)
-        ensure_compose_plugin
-        ensure_base_image
-        generate_compose
+up)
+    ensure_compose_plugin
+    ensure_base_image
 
-        cd "$COMPOSE_DIR"
-        if $DETACH; then
-            docker compose -p "$PROJECT" up -d
-        else
-            docker compose -p "$PROJECT" up
-        fi
+    # Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
+    PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+    if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
+        DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
+        PROJECT_IMAGE="codebox-opencode--${DIR_HASH}"
+        DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
 
-        # Print access info if running detached
-        if $DETACH; then
-            echo "Waiting for Tailscale..." >&2
-            for i in $(seq 1 15); do
-                IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
-                if [[ -n "$IP" ]]; then
-                    echo "OpenCode Web: http://${IP}:${PORT}" >&2
-                    break
-                fi
-                sleep 1
-            done
-            if [[ -z "${IP:-}" ]]; then
-                echo "Tailscale may need authentication." >&2
-                echo "Check 'codebox-web --logs' for the auth URL." >&2
-                echo "Or set TS_AUTH_KEY=tskey-... and restart." >&2
+        TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+        TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
+        if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
+            echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
+            echo "  It will be built and run on your machine; it can execute arbitrary" >&2
+            echo "  code and read mounted credentials. Only trust directories you control." >&2
+            if [[ ! -t 0 ]]; then
+                echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
+                echo "       Re-run with --trust if you trust this directory." >&2
+                exit 1
+            fi
+            read -r -p "Build and run it? [y/N] " ans
+            if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+                echo "Aborted." >&2
+                exit 1
             fi
         fi
-        ;;
+        mkdir -p "$(dirname "$TRUST_STORE")"
+        grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
 
-    stop)
-        ensure_compose_plugin
-        if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
-            cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" down
-        else
-            echo "Nothing running for $TARGET_DIR" >&2
+        EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
+            --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
+        if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
+            echo "Building project image for $TARGET_DIR..." >&2
+            docker build \
+                "${CACHE_ARG[@]}" \
+                --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
+                -t "$PROJECT_IMAGE" \
+                -f "$PROJECT_DOCKERFILE" \
+                "$TARGET_DIR"
         fi
-        ;;
+        RUN_IMAGE="$PROJECT_IMAGE"
+    fi
 
-    logs)
-        ensure_compose_plugin
-        cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" logs -f
-        ;;
+    generate_compose
 
-    status)
-        ensure_compose_plugin
-        cd "$COMPOSE_DIR" 2>/dev/null || true
-        echo "Project: $PROJECT" >&2
-        docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
+    cd "$COMPOSE_DIR"
+    if $DETACH; then
+        docker compose -p "$PROJECT" up -d
+    else
+        docker compose -p "$PROJECT" up
+    fi
 
-        IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
-        if [[ -n "$IP" ]]; then
-            echo "Tailscale IP: $IP" >&2
-            echo "URL: http://${IP}:${PORT}" >&2
+    # Print access info if running detached
+    if $DETACH; then
+        echo "Waiting for Tailscale..." >&2
+        for i in $(seq 1 15); do
+            IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+            if [[ -n "$IP" ]]; then
+                echo "OpenCode Web: http://${IP}:${PORT}" >&2
+                break
+            fi
+            sleep 1
+        done
+        if [[ -z "${IP:-}" ]]; then
+            echo "Tailscale may need authentication." >&2
+            echo "Check 'codebox-web --logs' for the auth URL." >&2
+            echo "Or set TS_AUTH_KEY=tskey-... and restart." >&2
         fi
-        ;;
+    fi
+    ;;
+
+stop)
+    ensure_compose_plugin
+    if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
+        cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" down
+    else
+        echo "Nothing running for $TARGET_DIR" >&2
+    fi
+    ;;
+
+logs)
+    ensure_compose_plugin
+    cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" logs -f
+    ;;
+
+status)
+    ensure_compose_plugin
+    cd "$COMPOSE_DIR" 2>/dev/null || true
+    echo "Project: $PROJECT" >&2
+    docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
+
+    IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+    if [[ -n "$IP" ]]; then
+        echo "Tailscale IP: $IP" >&2
+        echo "URL: http://${IP}:${PORT}" >&2
+    fi
+    ;;
 esac
