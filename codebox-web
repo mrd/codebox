@@ -254,9 +254,14 @@ up)
     if $DETACH; then
         echo "Waiting for Tailscale..." >&2
         for i in $(seq 1 15); do
-            IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+            STATUS=$(docker exec "${PROJECT}-tailscale-1" tailscale status 2>/dev/null || true)
+            IP=$(echo "$STATUS" | awk 'NR>1 && /^[0-9]/{print $1; exit}')
+            NAME=$(echo "$STATUS" | awk 'NR>1 && /^[0-9]/{print $2; exit}')
             if [[ -n "$IP" ]]; then
-                echo "OpenCode Web: http://${IP}:${PORT}" >&2
+                docker exec "${PROJECT}-tailscale-1" tailscale serve --bg --https 443 "http://localhost:${PORT}" 2>/dev/null || true
+                echo "OpenCode Web:" >&2
+                echo "  IP:  http://${IP}:${PORT}" >&2
+                echo "  DNS: https://${NAME}  (Tailscale Serve, no port)" >&2
                 break
             fi
             sleep 1
@@ -290,9 +295,13 @@ status)
     docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
 
     IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+    NAME=$(docker exec "${PROJECT}-tailscale-1" tailscale status 2>/dev/null | awk 'NR>1 && /^[0-9]/{print $2; exit}' || true)
     if [[ -n "$IP" ]]; then
+        docker exec "${PROJECT}-tailscale-1" tailscale serve --bg --https 443 "http://localhost:${PORT}" 2>/dev/null || true
         echo "Tailscale IP: $IP" >&2
-        echo "URL: http://${IP}:${PORT}" >&2
+        echo "URLs:" >&2
+        echo "  IP:  http://${IP}:${PORT}" >&2
+        echo "  DNS: https://${NAME}  (Tailscale Serve, no port)" >&2
     fi
     ;;
 esac
