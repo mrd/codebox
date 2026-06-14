@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+################################################################################
+#
+# codebox-tailclaude - Run Claude Code or OpenCode TUI in a Docker container
+#                      with a Tailscale sidecar, joining your tailnet.
+# Copyright (C) 2026 Matthew Danish
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+################################################################################
+#
+# Usage: codebox-tailclaude [OPTIONS] [DIR] [-- ARGS...]
+#
+# Run Claude Code or OpenCode TUI in an isolated Docker container with a
+# Tailscale sidecar, so the container joins your tailnet. The project
+# directory is mounted read-write into the container.
+#
+# Options:
+#   -r, --rebuild         Rebuild the base Docker image (uses layer cache)
+#   -R, --force-rebuild   Rebuild the base image ignoring cache
+#   --claude              Use Claude Code (default)
+#   --opencode            Use OpenCode instead of Claude Code
+#   --no-credentials      Do not mount credential/config directories; requires
+#                         ANTHROPIC_API_KEY for auth
+#   --no-gitconfig        Do not mount host ~/.gitconfig into the container
+#   --no-dockerfile       Ignore Dockerfile.codebox and use base image
+#   --trust               Trust Dockerfile.codebox without prompting
+#   -d, --detach          Run in background (default: foreground)
+#   --stop                Stop and remove containers (preserves config volumes)
+#   --logs                Follow logs
+#   --status              Show Tailscale IP and container status
+#   -h, --help            Show this help
+#
+# DIR defaults to the current working directory.
+# ARGS are passed through to claude or opencode.
+#
+# Credential mounts (default):
+#   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
+#   OpenCode:    ~/.config/opencode mounted read-write.
+#   With --no-credentials a dedicated sandbox config dir is mounted instead of
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox), so no
+#   host login state or host-executed hooks are exposed. Auth via
+#   ANTHROPIC_API_KEY in that case.
+#
+# Git config: ~/.gitconfig is mounted read-only into the container so that git
+#   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
+#
+# Job control: Ctrl-Z suspends the session and `fg` resumes it, like any other
+#   job-control program. (Under the hood Ctrl-Z detaches from the container and
+#   `fg` re-attaches; the container keeps running while suspended.)
+#
+# If DIR contains a Dockerfile.codebox, it is built on top of the base image
+# to add project-specific dependencies. It should start with:
+#   FROM codebox          (Claude Code, the default)
+#   FROM codebox-opencode (with --opencode)
+# Building it runs arbitrary code and the resulting image controls the
+# container, so codebox-tailclaude prompts for confirmation before building a
+# Dockerfile.codebox from a directory you have not already trusted. Trust is
+# remembered per (directory, file SHA); editing the file re-prompts. Use
+# --trust to skip the prompt (e.g. in scripts).
+#
+# Environment:
+#   TS_AUTH_KEY           Tailscale auth key (get one at
+#                         https://login.tailscale.com/admin/settings/authkeys)
+#   ANTHROPIC_API_KEY     Anthropic API key (required without credentials mount)
+#   ANTHROPIC_BASE_URL    Anthropic API base URL (default: https://api.anthropic.com)
+################################################################################
+
+set -euo pipefail
+
+usage() {
+    sed -n '/^# Usage:/,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+REBUILD=false
+NO_CACHE=false
+USE_OPENCODE=false
+NO_CREDS=false
+NO_GITCONFIG=false
+NO_DOCKERFILE=false
+TRUST=false
+DETACH=false
+ACTION="up"
+AFTER_DASHDASH=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--rebuild)        REBUILD=true; shift ;;
+        -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
+        --claude)            USE_OPENCODE=false; shift ;;
+        --opencode)          USE_OPENCODE=true;  shift ;;
+        --no-credentials)    NO_CREDS=true; shift ;;
+        --no-gitconfig)      NO_GITCONFIG=true; shift ;;
+        --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
+        --trust)             TRUST=true; shift ;;
+        -d|--detach)         DETACH=true; shift ;;
+        --stop)              ACTION="stop"; shift ;;
+        --logs)              ACTION="logs"; shift ;;
+        --status)            ACTION="status"; shift ;;
+        -h|--help)           usage ;;
+        --)                  shift; AFTER_DASHDASH=true; break ;;
+        -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
+        *)                   break ;;
+    esac
+done
+
+if ! $AFTER_DASHDASH; then
+    TARGET_DIR="${1:-$PWD}"
+    shift 2>/dev/null || true
+fi
+TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "error: directory not found: $TARGET_DIR" >&2
+    exit 1
+fi
+
+# Remaining args are passed through to the tool
+TOOL_ARGS=("$@")
+
+if $USE_OPENCODE; then
+    TOOL="opencode"
+    BASE_IMAGE="codebox-opencode"
+else
+    TOOL="claude"
+    BASE_IMAGE="codebox"
+fi
+
+SUFFIX="$(echo "$TARGET_DIR" | sha256sum | cut -c1-8)"
+PROJECT="codebox-tailclaude-${SUFFIX}"
+COMPOSE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/compose-tailclaude"
+
+command -v docker >/dev/null 2>&1 || { echo "error: docker not found" >&2; exit 1; }
+
+CACHE_ARG=()
+$NO_CACHE && CACHE_ARG=(--no-cache)
+
+ensure_base_image() {
+    if ! $REBUILD && docker image inspect "$BASE_IMAGE" &>/dev/null; then
+        return 0
+    fi
+    echo "Building $BASE_IMAGE..." >&2
+    if $USE_OPENCODE; then
+        docker build "${CACHE_ARG[@]}" -t "$BASE_IMAGE" - <<'DOCKERFILE'
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
+RUN curl -fsSL https://opencode.ai/install | bash
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+    | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
+ENTRYPOINT ["opencode"]
+DOCKERFILE
+    else
+        docker build "${CACHE_ARG[@]}" -t "$BASE_IMAGE" - <<'DOCKERFILE'
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+    | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
+ENTRYPOINT ["claude"]
+DOCKERFILE
+    fi
+}
+
+ensure_compose_plugin() {
+    docker compose version &>/dev/null && return 0
+    echo "error: 'docker compose' plugin not available" >&2
+    echo "Install Docker Compose v2: https://docs.docker.com/compose/install/" >&2
+    exit 1
+}
+
+# Build a JSON array for the compose command field from TOOL_ARGS.
+# ENTRYPOINT is already set to the tool in the Dockerfile, so this is just
+# the extra args passed after `--` on the command line.
+build_tool_command() {
+    if [[ ${#TOOL_ARGS[@]} -eq 0 ]]; then
+        echo "[]"
+        return
+    fi
+    local cmd="["
+    local first=true
+    for arg in "${TOOL_ARGS[@]}"; do
+        if $first; then
+            first=false
+        else
+            cmd+=","
+        fi
+        local escaped="${arg//\\/\\\\}"
+        escaped="${escaped//\"/\\\"}"
+        cmd+="\"${escaped}\""
+    done
+    cmd+="]"
+    echo "$cmd"
+}
+
+# Read .env.codebox, filter blocklist, return compose YAML env lines using
+# ${KEY:-} variable reference syntax (values NOT inlined in the YAML).
+generate_env_codebox_yaml() {
+    local env_file="$TARGET_DIR/.env.codebox"
+    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR")
+    local result=""
+
+    if [[ ! -f "$env_file" ]]; then
+        echo "$result"
+        return
+    fi
+
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+
+        local blocked=false
+        for b in "${blocklist[@]}"; do
+            [[ "$key" == "$b" ]] && { blocked=true; break; }
+        done
+        if $blocked; then
+            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
+            continue
+        fi
+        echo "forwarding env from .env.codebox: $key" >&2
+        result+="      ${key}: \${${key}:-}"$'\n'
+    done < "$env_file"
+    echo "$result"
+}
+
+# Export env vars from .env.codebox so compose variable substitution picks them
+# up. Values stay in process memory, not in the compose YAML on disk.
+export_env_codebox() {
+    local env_file="$TARGET_DIR/.env.codebox"
+    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR")
+    if [[ ! -f "$env_file" ]]; then
+        return
+    fi
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        local blocked=false
+        for b in "${blocklist[@]}"; do
+            [[ "$key" == "$b" ]] && { blocked=true; break; }
+        done
+        if $blocked; then
+            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
+            continue
+        fi
+        export "${key}=${value}"
+    done < "$env_file"
+}
+
+generate_compose() {
+    mkdir -p "$COMPOSE_DIR"
+
+    local tool_command
+    if $DETACH; then
+        # In detach mode, keep the container alive with sleep so the user can
+        # later attach with `docker exec -it`.
+        tool_command="[\"sleep\",\"infinity\"]"
+    else
+        tool_command="$(build_tool_command)"
+    fi
+
+    local env_codebox
+    env_codebox="$(generate_env_codebox_yaml)"
+
+    if $USE_OPENCODE; then
+        if $NO_CREDS; then
+            CONFIG_MOUNT="${HOME}/.config/opencode-codebox:/home/sandbox/.config/opencode"
+        else
+            CONFIG_MOUNT="${HOME}/.config/opencode:/home/sandbox/.config/opencode"
+        fi
+        mkdir -p "${CONFIG_MOUNT%%:*}"
+    else
+        if $NO_CREDS; then
+            CONFIG_MOUNT="${HOME}/.claude-codebox:/home/sandbox/.claude"
+        else
+            CONFIG_MOUNT="${HOME}/.claude:/home/sandbox/.claude"
+        fi
+        mkdir -p "${CONFIG_MOUNT%%:*}"
+    fi
+
+    cat > "$COMPOSE_DIR/docker-compose.yml" <<EOF
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: ${TOOL}-${SUFFIX}
+    environment:
+      TS_AUTH_KEY: \${TS_AUTH_KEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: \${TS_EXTRA_ARGS:-}
+    volumes:
+      - ts-data-${SUFFIX}:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+
+  ${TOOL}:
+    image: ${RUN_IMAGE}
+    network_mode: "service:tailscale"
+    user: "$(id -u):$(id -g)"
+    stdin_open: true
+    tty: true
+    environment:
+      HOME: /home/sandbox
+$( [[ -z "${ANTHROPIC_API_KEY:-}" ]] || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}" )
+$( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}" )
+      BROWSER: /bin/true
+$( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
+${env_codebox}
+    volumes:
+      - "${TARGET_DIR}:${TARGET_DIR}"
+      - ${CONFIG_MOUNT}
+EOF
+
+    # Mount ~/.claude.json for Claude (not with --no-credentials)
+    if ! $USE_OPENCODE && ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
+        echo "      - ${HOME}/.claude.json:/home/sandbox/.claude.json" >> "$COMPOSE_DIR/docker-compose.yml"
+    fi
+
+    # Gitconfig mount
+    if ! $NO_GITCONFIG && [[ -f "${HOME}/.gitconfig" ]]; then
+        echo "      - ${HOME}/.gitconfig:/home/sandbox/.gitconfig:ro" >> "$COMPOSE_DIR/docker-compose.yml"
+    fi
+
+    cat >> "$COMPOSE_DIR/docker-compose.yml" <<EOF
+    working_dir: "${TARGET_DIR}"
+    command: ${tool_command}
+    depends_on:
+      - tailscale
+
+volumes:
+  ts-data-${SUFFIX}:
+EOF
+}
+
+container_name() {
+    docker ps --filter "name=${PROJECT}-${TOOL}" --format '{{.Names}}' 2>/dev/null | head -1 || true
+}
+
+container_running() {
+    local name
+    name="$(container_name)"
+    [[ -n "$name" ]]
+}
+
+case "$ACTION" in
+up)
+    ensure_compose_plugin
+    ensure_base_image
+
+    RUN_IMAGE="$BASE_IMAGE"
+
+    # Check for a project-specific Dockerfile
+    PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+    if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
+        DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
+        PROJECT_IMAGE="${BASE_IMAGE}--${DIR_HASH}"
+        DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
+
+        TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+        TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
+        if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
+            echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
+            echo "  It will be built and run on your machine; it can execute arbitrary" >&2
+            echo "  code and read mounted credentials. Only trust directories you control." >&2
+            if [[ ! -t 0 ]]; then
+                echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
+                echo "       Re-run with --trust if you trust this directory." >&2
+                exit 1
+            fi
+            read -r -p "Build and run it? [y/N] " ans
+            if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+                echo "Aborted." >&2
+                exit 1
+            fi
+        fi
+        mkdir -p "$(dirname "$TRUST_STORE")"
+        grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
+
+        EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
+            --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
+        if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
+            echo "Building project image for $TARGET_DIR..." >&2
+            docker build \
+                "${CACHE_ARG[@]}" \
+                --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
+                -t "$PROJECT_IMAGE" \
+                -f "$PROJECT_DOCKERFILE" \
+                "$TARGET_DIR"
+        fi
+        RUN_IMAGE="$PROJECT_IMAGE"
+    fi
+
+    generate_compose
+
+    # Export .env.codebox vars so compose variable substitution picks them up
+    # (values stay in process memory, not inlined in the YAML on disk).
+    export_env_codebox
+
+    cd "$COMPOSE_DIR"
+    if $DETACH; then
+        docker compose -p "$PROJECT" up -d
+        # Wait for tailscale and print IP
+        for i in $(seq 1 15); do
+            IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+            if [[ -n "$IP" ]]; then
+                echo "Tailnet IP: $IP" >&2
+                TOOL_CONTAINER="$(container_name)"
+                if [[ -n "$TOOL_CONTAINER" ]]; then
+                    echo "Run: docker exec -it $TOOL_CONTAINER ${TOOL}" >&2
+                fi
+                break
+            fi
+            sleep 1
+        done
+    else
+        docker compose -p "$PROJECT" up -d
+
+        # Wait for the tool container to start
+        TOOL_CONTAINER=""
+        for i in $(seq 1 10); do
+            TOOL_CONTAINER="$(container_name)"
+            if [[ -n "$TOOL_CONTAINER" ]]; then
+                break
+            fi
+            sleep 1
+        done
+        if [[ -z "$TOOL_CONTAINER" ]]; then
+            echo "error: ${TOOL} container did not start" >&2
+            docker compose -p "$PROJECT" down
+            exit 1
+        fi
+
+        if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+            for i in $(seq 1 15); do
+                IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+                if [[ -n "$IP" ]]; then
+                    echo "Tailnet IP: $IP" >&2
+                    break
+                fi
+                sleep 1
+            done
+        fi
+
+        # Attach interactively with Ctrl-Z detach support
+        docker attach --detach-keys ctrl-z "$TOOL_CONTAINER" || true
+
+        while container_running; do
+            kill -TSTP $$
+            container_running || break
+            TOOL_CONTAINER="$(container_name)"
+            docker attach --detach-keys ctrl-z "$TOOL_CONTAINER" || true
+        done
+
+        # Clean up when the TUI exits
+        docker compose -p "$PROJECT" down
+    fi
+    ;;
+
+stop)
+    ensure_compose_plugin
+    if [[ -f "$COMPOSE_DIR/docker-compose.yml" ]]; then
+        cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" down
+    else
+        echo "Nothing running for $TARGET_DIR" >&2
+    fi
+    ;;
+
+logs)
+    ensure_compose_plugin
+    cd "$COMPOSE_DIR" && docker compose -p "$PROJECT" logs -f
+    ;;
+
+status)
+    ensure_compose_plugin
+    cd "$COMPOSE_DIR" 2>/dev/null || true
+    docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
+    IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+    if [[ -n "$IP" ]]; then
+        echo "Tailnet IP: $IP" >&2
+        echo "Hostname: ${TOOL}-${SUFFIX}" >&2
+    fi
+    ;;
+esac
