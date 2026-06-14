@@ -336,11 +336,10 @@ services:
     environment:
       TS_AUTH_KEY: \${TS_AUTH_KEY:-}
       TS_STATE_DIR: /var/lib/tailscale
-      TS_EXTRA_ARGS: --socket=/var/run/tailscale/tailscaled.sock \${TS_EXTRA_ARGS:-}
-      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_EXTRA_ARGS: \${TS_EXTRA_ARGS:-}
     volumes:
       - ts-data-${SUFFIX}:/var/lib/tailscale
-      - ts-socket-${SUFFIX}:/var/run/tailscale
+      - ts-socket-${SUFFIX}:/tmp
       - /dev/net/tun:/dev/net/tun
     cap_add:
       - NET_ADMIN
@@ -361,12 +360,12 @@ services:
 $( [[ -z "${ANTHROPIC_API_KEY:-}" ]] || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}" )
 $( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}" )
       BROWSER: /bin/true
-      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_SOCKET: /tmp/tailscaled.sock
       OPENCODE_YOLO: "true"
 $( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
 ${env_codebox}
     volumes:
-      - ts-socket-${SUFFIX}:/var/run/tailscale
+      - ts-socket-${SUFFIX}:/tmp
       - "${TARGET_DIR}:${TARGET_DIR}"
       - ${CONFIG_MOUNT}
 $( $USE_OPENCODE && echo "      - ${STATE_MOUNT}" )
