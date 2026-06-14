@@ -165,7 +165,7 @@ ensure_base_image() {
     fi
     echo "Building $BASE_IMAGE..." >&2
     if $USE_OPENCODE; then
-        docker build "${CACHE_ARG[@]}" -t "$BASE_IMAGE" - <<'DOCKERFILE'
+        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates \
@@ -180,7 +180,7 @@ RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
 ENTRYPOINT ["opencode"]
 DOCKERFILE
     else
-        docker build "${CACHE_ARG[@]}" -t "$BASE_IMAGE" - <<'DOCKERFILE'
+        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates \
@@ -515,6 +515,7 @@ up)
                 fi
             } | docker build \
                 "${CACHE_ARG[@]}" \
+                --network=host \
                 --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
                 -t "$PROJECT_IMAGE" \
                 -f - \
