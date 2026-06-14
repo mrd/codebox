@@ -40,6 +40,10 @@
 #   --stop                Stop and remove containers (preserves config volumes)
 #   --logs                Follow logs
 #   --status              Show Tailscale IP and container status
+#   --serve PORT          Expose local PORT on the tailnet via Tailscale Serve
+#                         (default: HTTP; use --https PORT for HTTPS)
+#   --https PORT          Serve HTTPS on PORT (implies TLS-terminated HTTPS)
+#   --http                Serve plain HTTP (default)
 #   -h, --help            Show this help
 #
 # DIR defaults to the current working directory.
@@ -93,6 +97,9 @@ TRUST=false
 DETACH=false
 ACTION="up"
 AFTER_DASHDASH=false
+SERVE_PORT=""
+SERVE_HTTPS_PORT=443
+SERVE_HTTP=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -108,6 +115,9 @@ while [[ $# -gt 0 ]]; do
         --stop)              ACTION="stop"; shift ;;
         --logs)              ACTION="logs"; shift ;;
         --status)            ACTION="status"; shift ;;
+        --serve)             SERVE_PORT="$2"; shift 2 ;;
+        --https)             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
+        --http)              SERVE_HTTP=true; shift ;;
         -h|--help)           usage ;;
         --)                  shift; AFTER_DASHDASH=true; break ;;
         -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -370,6 +380,24 @@ container_running() {
     [[ -n "$name" ]]
 }
 
+tailscale_container() {
+    docker ps --filter "name=${PROJECT}-tailscale" --format '{{.Names}}' 2>/dev/null | head -1 || true
+}
+
+do_serve() {
+    local port="$1"
+    local ts_container
+    ts_container="$(tailscale_container)"
+    [[ -z "$ts_container" ]] && return 1
+    if $SERVE_HTTP; then
+        echo "Setting up Tailscale Serve (HTTP): http://localhost:${port}" >&2
+        docker exec "$ts_container" tailscale serve --bg "http://localhost:${port}"
+    else
+        echo "Setting up Tailscale Serve (HTTPS :${SERVE_HTTPS_PORT}): https://${TOOL}-${SUFFIX} → http://localhost:${port}" >&2
+        docker exec "$ts_container" tailscale serve --bg --https "${SERVE_HTTPS_PORT}" "http://localhost:${port}"
+    fi
+}
+
 case "$ACTION" in
 up)
     ensure_compose_plugin
@@ -438,7 +466,7 @@ up)
         docker compose -p "$PROJECT" up -d
         # Wait for tailscale and print IP
         for i in $(seq 1 15); do
-            IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+            IP=$(docker exec "$(tailscale_container)" tailscale ip -4 2>/dev/null || true)
             if [[ -n "$IP" ]]; then
                 echo "Tailnet IP: $IP" >&2
                 TOOL_CONTAINER="$(container_name)"
@@ -449,11 +477,11 @@ up)
             fi
             sleep 1
         done
+        if [[ -n "$SERVE_PORT" ]]; then
+            do_serve "$SERVE_PORT"
+        fi
     else
         docker compose -p "$PROJECT" up -d
-
-        # Wait for the tool container to start
-        TOOL_CONTAINER=""
         for i in $(seq 1 10); do
             TOOL_CONTAINER="$(container_name)"
             if [[ -n "$TOOL_CONTAINER" ]]; then
@@ -469,13 +497,21 @@ up)
 
         if [[ -n "${TS_AUTH_KEY:-}" ]]; then
             for i in $(seq 1 15); do
-                IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+                IP=$(docker exec "$(tailscale_container)" tailscale ip -4 2>/dev/null || true)
                 if [[ -n "$IP" ]]; then
                     echo "Tailnet IP: $IP" >&2
                     break
                 fi
                 sleep 1
             done
+        fi
+
+        if [[ -n "$SERVE_PORT" ]]; then
+            if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+                do_serve "$SERVE_PORT"
+            else
+                echo "note: --serve requires TS_AUTH_KEY to configure Tailscale" >&2
+            fi
         fi
 
         # Attach interactively with Ctrl-Z detach support
@@ -511,7 +547,7 @@ status)
     ensure_compose_plugin
     cd "$COMPOSE_DIR" 2>/dev/null || true
     docker compose -p "$PROJECT" ps 2>/dev/null || echo "Not running" >&2
-    IP=$(docker exec "${PROJECT}-tailscale-1" tailscale ip -4 2>/dev/null || true)
+    IP=$(docker exec "$(tailscale_container)" tailscale ip -4 2>/dev/null || true)
     if [[ -n "$IP" ]]; then
         echo "Tailnet IP: $IP" >&2
         echo "Hostname: ${TOOL}-${SUFFIX}" >&2
