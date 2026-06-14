@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+################################################################################
+#
+# codebox-ts - Run Claude Code or OpenCode in a Docker container with Tailscale,
+#              joining your tailnet for remote access from other devices.
+# Copyright (C) 2026 Matthew Danish
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+################################################################################
+#
+# Run Claude Code or OpenCode in an isolated Docker container with Tailscale,
+# so the container joins your tailnet. Your project directory is mounted
+# read-write into the container.
+# Usage: codebox-ts [OPTIONS] [DIR] [-- ARGS...]
+#
+# Options:
+#   -r, --rebuild         Rebuild the Docker image(s) (uses layer cache)
+#   -R, --force-rebuild   Rebuild the image(s) ignoring cache
+#   --claude              Use Claude Code (default)
+#   --opencode            Use OpenCode instead of Claude Code
+#   --no-credentials      Do not mount credential/config directories; requires
+#                         ANTHROPIC_API_KEY for auth
+#   --no-gitconfig        Do not mount host ~/.gitconfig into the container
+#   --no-dockerfile       Ignore Dockerfile.codebox and use base image
+#   --trust               Trust Dockerfile.codebox without prompting
+#   -h, --help            Show this help
+#
+# DIR defaults to the current working directory.
+# ARGS are passed through to claude or opencode.
+#
+# Credential mounts (default):
+#   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
+#   OpenCode:    ~/.config/opencode mounted read-write.
+#   With --no-credentials a dedicated sandbox config dir is mounted instead of
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox), so no
+#   host login state or host-executed hooks are exposed. Auth via
+#   ANTHROPIC_API_KEY in that case.
+#
+# Git config: ~/.gitconfig is mounted read-only into the container so that git
+#   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
+#
+# Job control: Ctrl-Z suspends the session and `fg` resumes it, like any other
+#   job-control program. (Under the hood Ctrl-Z detaches from the container and
+#   `fg` re-attaches; the container keeps running while suspended.)
+#
+# Environment: If the target directory contains a .env.codebox file, each
+#   KEY=VALUE line is forwarded as an environment variable to the container.
+#   Sensitive keys (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
+#   CLAUDE_CONFIG_DIR) are refused since .env.codebox may come from an untrusted
+#   target directory; forwarded keys are printed before the container starts.
+#
+# If DIR contains a Dockerfile.codebox, it is built on top of the base image
+# to add project-specific dependencies. It should start with:
+#   FROM codebox-ts          (Claude Code, the default)
+#   FROM codebox-opencode-ts (with --opencode)
+# Building it runs arbitrary code and the resulting image controls the
+# container, so codebox-ts prompts for confirmation before building a
+# Dockerfile.codebox from a directory you have not already trusted. Trust is
+# remembered per (directory, file SHA); editing the file re-prompts. Use
+# --trust to skip the prompt (e.g. in scripts).
+#
+# Environment:
+#   TS_AUTH_KEY           Tailscale auth key (get one at
+#                         https://login.tailscale.com/admin/settings/authkeys)
+#   ANTHROPIC_API_KEY     Anthropic API key (required without credentials mount)
+################################################################################
+
+set -euo pipefail
+
+usage() {
+    sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+IMAGE_NAME="codebox-ts"
+ARCH="amd64"
+REBUILD=false
+NO_CACHE=false
+USE_OPENCODE=false
+NO_CREDS=false
+NO_GITCONFIG=false
+NO_DOCKERFILE=false
+TRUST=false
+
+case "$(uname -m)" in
+    aarch64|arm64) ARCH="arm64" ;;
+    x86_64|amd64)  ARCH="amd64"  ;;
+esac
+
+# Parse options
+AFTER_DASHDASH=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--rebuild)        REBUILD=true; shift ;;
+        -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
+        --claude)            USE_OPENCODE=false; shift ;;
+        --opencode)          USE_OPENCODE=true;  shift ;;
+        --no-credentials)    NO_CREDS=true; shift ;;
+        --no-gitconfig)      NO_GITCONFIG=true; shift ;;
+        --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
+        --trust)             TRUST=true; shift ;;
+        -h|--help)           usage ;;
+        --)                  shift; AFTER_DASHDASH=true; break ;;
+        -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
+        *)                   break ;;
+    esac
+done
+
+if ! $AFTER_DASHDASH; then
+    TARGET_DIR="${1:-$PWD}"
+    shift 2>/dev/null || true
+fi
+TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "error: directory not found: $TARGET_DIR" >&2
+    exit 1
+fi
+
+if $USE_OPENCODE; then
+    TOOL="opencode"
+    IMAGE_NAME="codebox-opencode-ts"
+else
+    TOOL="claude"
+    IMAGE_NAME="codebox-ts"
+fi
+
+# Build cache flag (empty unless cache-busting was requested). Using an array
+# avoids the ${NO_CACHE:+...} trap where the literal string "false" is non-empty
+# and would expand to --no-cache.
+CACHE_ARG=()
+$NO_CACHE && CACHE_ARG=(--no-cache)
+
+# Build image if missing or rebuild requested
+if $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    echo "Building $IMAGE_NAME..." >&2
+    docker build "${CACHE_ARG[@]}" -t "$IMAGE_NAME" - <<DOCKERFILE
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox /tmp/tailscale /home/sandbox/.cache /var/run/tailscale \
+    && chmod 777 /var/run/tailscale \
+    && chmod 777 /home/sandbox /home/sandbox/.cache /tmp/tailscale
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:/home/sandbox/.opencode/bin:\$PATH"
+
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_${ARCH}.tgz" \
+    | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale' '*/tailscaled'
+
+RUN if [ "$TOOL" = "claude" ]; then \
+        curl -fsSL https://claude.ai/install.sh | bash; \
+    else \
+        curl -fsSL https://opencode.ai/install | bash; \
+    fi
+
+RUN printf '%s\n' '#!/bin/bash' \
+    'tailscaled --tun=userspace-networking --state=/home/sandbox/.cache/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
+    'sleep 2' \
+    '[ -n "\$TS_AUTH_KEY" ] && tailscale up --authkey="\$TS_AUTH_KEY" 2>/dev/null || true' \
+    'exec "\${DEFAULT_TOOL:-claude}" "\$@"' > /entrypoint.sh \
+    && chmod +x /entrypoint.sh
+
+ENV DEFAULT_TOOL=$TOOL
+ENTRYPOINT ["/entrypoint.sh"]
+DOCKERFILE
+fi
+
+# Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
+PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+RUN_IMAGE="$IMAGE_NAME"
+
+if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
+    DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
+    PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
+    DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
+
+    # A Dockerfile.codebox is arbitrary code run at build time (and controls the
+    # container's ENTRYPOINT, so it can read the mounted credentials). Since the
+    # target directory may be untrusted (e.g. a cloned repo), require explicit
+    # trust before building one. Trust is remembered per (directory, SHA) so an
+    # unchanged Dockerfile is not re-prompted; editing it re-prompts.
+    TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+    TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
+    if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
+        echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
+        echo "  It will be built and run on your machine; it can execute arbitrary" >&2
+        echo "  code and read mounted credentials. Only trust directories you control." >&2
+        if [[ ! -t 0 ]]; then
+            echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
+            echo "       Re-run with --trust if you trust this directory." >&2
+            exit 1
+        fi
+        read -r -p "Build and run it? [y/N] " ans
+        if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+            echo "Aborted." >&2
+            exit 1
+        fi
+    fi
+    mkdir -p "$(dirname "$TRUST_STORE")"
+    grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
+
+    EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
+        --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
+    if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
+        echo "Building project image for $TARGET_DIR..." >&2
+        docker build \
+            "${CACHE_ARG[@]}" \
+            --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
+            -t "$PROJECT_IMAGE" \
+            -f "$PROJECT_DOCKERFILE" \
+            "$TARGET_DIR"
+    fi
+    RUN_IMAGE="$PROJECT_IMAGE"
+fi
+
+# Build env var arguments
+ENV_ARGS=()
+ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL TS_AUTH_KEY)
+if ! $USE_OPENCODE; then
+    ENV_VARS+=(CLAUDE_CONFIG_DIR)
+fi
+for var in "${ENV_VARS[@]}"; do
+    if [[ -n "${!var:-}" ]]; then
+        ENV_ARGS+=(-e "$var=${!var}")
+    fi
+done
+
+# Load .env.codebox from the target directory if present
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR)
+ENV_FILE="$TARGET_DIR/.env.codebox"
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        blocked=false
+        for b in "${ENV_BLOCKLIST[@]}"; do
+            [[ "$key" == "$b" ]] && { blocked=true; break; }
+        done
+        if $blocked; then
+            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
+            continue
+        fi
+        echo "forwarding env from .env.codebox: $key" >&2
+        ENV_ARGS+=(-e "${key}=${value}")
+    done < "$ENV_FILE"
+fi
+
+# Credential/config mounts.
+#
+# With --no-credentials we mount a *dedicated* sandbox config dir rather than the
+# host's real one. The host config dir is more than credentials: on Linux the
+# OAuth refresh token lives in ~/.claude/.credentials.json, and ~/.claude both
+# stores settings.json (which can define hooks that run on the host) and is
+# mounted read-write. Pointing the container at a separate dir keeps cross-run
+# persistence for the sandbox without exposing host login state or letting the
+# sandbox write host-executed hooks. Auth is then expected via ANTHROPIC_API_KEY.
+if $USE_OPENCODE; then
+    if $NO_CREDS; then
+        OPENCODE_CONFIG_HOST="${HOME}/.config/opencode-codebox"
+    else
+        OPENCODE_CONFIG_HOST="${HOME}/.config/opencode"
+    fi
+    mkdir -p "$OPENCODE_CONFIG_HOST"
+    CRED_MOUNTS=(-v "${OPENCODE_CONFIG_HOST}:/home/sandbox/.config/opencode")
+else
+    if $NO_CREDS; then
+        CLAUDE_HOST_DIR="${HOME}/.claude-codebox"
+    else
+        CLAUDE_HOST_DIR="${HOME}/.claude"
+    fi
+    mkdir -p "$CLAUDE_HOST_DIR"
+    CRED_MOUNTS=(-v "${CLAUDE_HOST_DIR}:/home/sandbox/.claude")
+    if ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
+        CRED_MOUNTS+=(-v "${HOME}/.claude.json:/home/sandbox/.claude.json")
+    fi
+fi
+
+# Mount host ~/.gitconfig read-only inside the container (opt-out via --no-gitconfig)
+GITCONFIG_MOUNTS=()
+if ! $NO_GITCONFIG && [[ -f "${HOME}/.gitconfig" ]]; then
+    GITCONFIG_MOUNTS=(-v "${HOME}/.gitconfig:/home/sandbox/.gitconfig:ro")
+fi
+
+CONTAINER_NAME="codebox-ts-$(id -u)-$$"
+
+# Ctrl-Z / fg job control.
+#
+# Goal: Ctrl-Z suspends the session and `fg` resumes it, like a normal program.
+# This can't be done by forwarding the signal: `docker run -it` holds the host
+# terminal in raw mode (ISIG cleared), so Ctrl-Z reaches the container as raw
+# byte 0x1a and never generates SIGTSTP on the host -- the host shell never sees
+# a stopped job, so there is nothing for `fg` to resume. (And the forwarded byte
+# just stops claude *inside* the container while docker keeps the terminal.)
+#
+# So we build it on top of `docker attach` instead. Map Ctrl-Z to Docker's
+# --detach-keys sequence: on Ctrl-Z the docker run/attach process exits cleanly
+# (restoring the terminal) while the container keeps running. We then stop *this
+# script* with SIGTSTP, so it becomes a stopped job in the host shell; when the
+# user runs `fg` the script continues and re-attaches to the still-running
+# container. Repeat for as many Ctrl-Z / fg cycles as the user likes.
+container_running() { docker container inspect "$CONTAINER_NAME" &>/dev/null; }
+
+docker run --rm -it \
+    --name "$CONTAINER_NAME" \
+    --detach-keys "ctrl-z" \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" \
+    -v "$TARGET_DIR:$TARGET_DIR" \
+    "${CRED_MOUNTS[@]}" \
+    "${GITCONFIG_MOUNTS[@]}" \
+    -w "$TARGET_DIR" \
+    -e HOME=/home/sandbox \
+    -e BROWSER=/bin/true \
+    "${ENV_ARGS[@]}" \
+    "$RUN_IMAGE" \
+    "$@" || true
+
+# As long as the container is still alive after the foreground process exited,
+# the user detached with Ctrl-Z: suspend ourselves (the shell reports a stopped
+# job) and reattach when `fg` continues us.
+while container_running; do
+    kill -TSTP $$
+    container_running || break
+    docker attach --detach-keys ctrl-z "$CONTAINER_NAME" || true
+done
+
+echo "Container removed from tailnet." >&2
