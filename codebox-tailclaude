@@ -317,9 +317,6 @@ generate_compose() {
         mkdir -p "${CONFIG_MOUNT%%:*}"
     fi
 
-    local HOME_VOL="/tmp/codebox-home-${SUFFIX}"
-    mkdir -p "$HOME_VOL"
-
     cat > "$COMPOSE_DIR/docker-compose.yml" <<EOF
 services:
   tailscale:
@@ -345,6 +342,9 @@ services:
     tty: true
     environment:
       HOME: /home/sandbox
+      XDG_DATA_HOME: /tmp/.local/share
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_STATE_HOME: /tmp/.local/state
 $( [[ -z "${ANTHROPIC_API_KEY:-}" ]] || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}" )
 $( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}" )
       BROWSER: /bin/true
@@ -352,7 +352,6 @@ $( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTH
 $( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
 ${env_codebox}
     volumes:
-      - ${HOME_VOL}:/home/sandbox
       - "${TARGET_DIR}:${TARGET_DIR}"
       - ${CONFIG_MOUNT}
 EOF
