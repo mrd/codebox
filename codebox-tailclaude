@@ -345,6 +345,7 @@ services:
 $( [[ -z "${ANTHROPIC_API_KEY:-}" ]] || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}" )
 $( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}" )
       BROWSER: /bin/true
+      OPENCODE_YOLO: "true"
 $( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
 ${env_codebox}
     volumes:
