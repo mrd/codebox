@@ -44,6 +44,8 @@
 #                         (default: HTTP; use --https PORT for HTTPS)
 #   --https PORT          Serve HTTPS on PORT (implies TLS-terminated HTTPS)
 #   --http                Serve plain HTTP (default)
+#   --init                Generate a Dockerfile.codebox template for this
+#                         directory (explains mounts, working dir, etc.)
 #   -h, --help            Show this help
 #
 # DIR defaults to the current working directory.
@@ -118,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --serve)             SERVE_PORT="$2"; shift 2 ;;
         --https)             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
         --http)              SERVE_HTTP=true; shift ;;
+        --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
         --)                  shift; AFTER_DASHDASH=true; break ;;
         -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -399,6 +402,51 @@ do_serve() {
 }
 
 case "$ACTION" in
+init)
+    DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+    if [[ -f "$DOCKERFILE" ]]; then
+        echo "error: $DOCKERFILE already exists" >&2
+        exit 1
+    fi
+    cat > "$DOCKERFILE" <<'DOCKERFILE'
+# Dockerfile.codebox — project dependencies for codebox-tailclaude
+# =================================================================
+# Your coding agent (Claude/OpenCode) can edit or recreate this file to
+# pre-install system packages, language runtimes, and project deps.
+#
+# No FROM line needed — the script auto-injects the correct base image
+# (codebox for Claude, codebox-opencode for OpenCode).
+#
+# Container context:
+#   HOME = /home/sandbox
+#   USER = your host uid:gid (e.g. 1000:1000)
+#   Working directory = your project directory (mounted read-write)
+#   Credentials ~/.claude or ~/.config/opencode = mounted from host
+#   Git config = mounted from host (~/.gitconfig, read-only)
+#   Tailscale socket = shared with sidecar for 'tailscale serve'
+#
+# The base image is Debian trixie-slim with curl, git, ca-certificates
+# pre-installed. You have full apt access for additional packages.
+
+# Install system packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # add packages here (one per line) \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install language runtimes (examples):
+# RUN curl -fsSL https://astral.sh/uv/install.sh | sh
+# RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs
+
+# Install project dependencies (examples):
+# RUN uv sync
+# RUN npm install
+
+# Build step (example):
+# RUN make build
+DOCKERFILE
+    echo "Wrote $DOCKERFILE" >&2
+    ;;
+
 up)
     ensure_compose_plugin
     ensure_base_image
