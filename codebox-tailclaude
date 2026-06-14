@@ -349,6 +349,7 @@ $( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTH
 $( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
 ${env_codebox}
     volumes:
+      - home-${SUFFIX}:/home/sandbox
       - "${TARGET_DIR}:${TARGET_DIR}"
       - ${CONFIG_MOUNT}
 EOF
@@ -371,6 +372,7 @@ EOF
 
 volumes:
   ts-data-${SUFFIX}:
+  home-${SUFFIX}:
 EOF
 }
 
