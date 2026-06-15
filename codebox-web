@@ -37,6 +37,9 @@
 #                         ANTHROPIC_API_KEY instead
 #   --init                Generate a Dockerfile.codebox template for this
 #                         directory (explains mounts, working dir, etc.)
+#   -p, --publish HOST:PORT
+#                         Publish a port from the container to the host
+#                         (e.g. 127.0.0.1:3000:3000)
 #   --no-dockerfile       Ignore Dockerfile.codebox and use base image
 #   --trust               Trust Dockerfile.codebox without prompting
 #   -h, --help            Show this help
@@ -78,6 +81,7 @@ ACTION="up"
 NO_CREDS=false
 NO_DOCKERFILE=false
 TRUST=false
+PUBLISH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -90,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         --status)            ACTION="status"; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --init)              ACTION="init"; shift ;;
+        -p|--publish)        PUBLISH="$2"; shift 2 ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
         -h|--help)           usage ;;
@@ -154,6 +159,8 @@ services:
       TS_AUTH_KEY: \${TS_AUTH_KEY:-}
       TS_STATE_DIR: /var/lib/tailscale
       TS_EXTRA_ARGS: \${TS_EXTRA_ARGS:-}
+$( [[ -z "$PUBLISH" ]] || echo "    ports:" )
+$( [[ -z "$PUBLISH" ]] || echo "      - \"${PUBLISH}\"" )
     volumes:
       - ts-data-${SUFFIX}:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
