@@ -232,6 +232,10 @@ init)
 #   Git config = mounted from host (~/.gitconfig, read-only)
 #   Tailscale socket = shared with sidecar for 'tailscale serve'
 #
+# Available as --build-arg: USER_ID (host uid), GROUP_ID (host gid).
+# Use them to chown files installed during build to match the runtime user:
+#   RUN chown -R $USER_ID:$GROUP_ID /opt/android-sdk
+#
 # The base image is Debian trixie-slim with curl, git, ca-certificates
 # and xdg-utils pre-installed. You have full apt access for additional
 # packages.
@@ -302,6 +306,8 @@ up)
             } | docker build \
                 "${CACHE_ARG[@]}" \
                 --network=host \
+                --build-arg "USER_ID=$(id -u)" \
+                --build-arg "GROUP_ID=$(id -g)" \
                 --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
                 -t "$PROJECT_IMAGE" \
                 -f - \

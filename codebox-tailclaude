@@ -46,6 +46,9 @@
 #   --http                Serve plain HTTP (default)
 #   --init                Generate a Dockerfile.codebox template for this
 #                         directory (explains mounts, working dir, etc.)
+#   --mount HOST:CONTAINER
+#                         Additional bind mount (can be repeated; also reads
+#                         CODEBOX_MOUNTS from .env.codebox)
 #   -h, --help            Show this help
 #
 # DIR defaults to the current working directory.
@@ -102,6 +105,7 @@ AFTER_DASHDASH=false
 SERVE_PORT=""
 SERVE_HTTPS_PORT=443
 SERVE_HTTP=true
+EXTRA_MOUNTS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -121,6 +125,7 @@ while [[ $# -gt 0 ]]; do
         --https)             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
         --http)              SERVE_HTTP=true; shift ;;
         --init)              ACTION="init"; shift ;;
+        --mount)             EXTRA_MOUNTS+=("$2"); shift 2 ;;
         -h|--help)           usage ;;
         --)                  shift; AFTER_DASHDASH=true; break ;;
         -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -381,6 +386,24 @@ EOF
         echo "      - ${HOME}/.gitconfig:/home/sandbox/.gitconfig:ro" >> "$COMPOSE_DIR/docker-compose.yml"
     fi
 
+    # Extra mounts from --mount flags
+    for m in "${EXTRA_MOUNTS[@]}"; do
+        echo "      - $m" >> "$COMPOSE_DIR/docker-compose.yml"
+    done
+
+    # Extra mounts from CODEBOX_MOUNTS in .env.codebox
+    if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
+        local env_mounts
+        env_mounts="$(grep -E '^CODEBOX_MOUNTS=' "$TARGET_DIR/.env.codebox" | sed 's/^CODEBOX_MOUNTS=//' | tr -d '"'"'" || true)"
+        if [[ -n "$env_mounts" ]]; then
+            while IFS=' ' read -ra mounts; do
+                for m in "${mounts[@]}"; do
+                    echo "      - $m" >> "$COMPOSE_DIR/docker-compose.yml"
+                done
+            done <<< "$env_mounts"
+        fi
+    fi
+
     cat >> "$COMPOSE_DIR/docker-compose.yml" <<EOF
     working_dir: "${TARGET_DIR}"
     command: ${tool_command}
@@ -444,6 +467,10 @@ init)
 #   Credentials ~/.claude or ~/.config/opencode = mounted from host
 #   Git config = mounted from host (~/.gitconfig, read-only)
 #   Tailscale socket = shared with sidecar for 'tailscale serve'
+#
+# Available as --build-arg: USER_ID (host uid), GROUP_ID (host gid).
+# Use them to chown files installed during build to match the runtime user:
+#   RUN chown -R $USER_ID:$GROUP_ID /opt/android-sdk
 #
 # The base image is Debian trixie-slim with curl, git, ca-certificates
 # pre-installed. You have full apt access for additional packages.
@@ -516,6 +543,8 @@ up)
             } | docker build \
                 "${CACHE_ARG[@]}" \
                 --network=host \
+                --build-arg "USER_ID=$(id -u)" \
+                --build-arg "GROUP_ID=$(id -g)" \
                 --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
                 -t "$PROJECT_IMAGE" \
                 -f - \

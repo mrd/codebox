@@ -218,11 +218,23 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
         --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
     if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
         echo "Building project image for $TARGET_DIR..." >&2
-        docker build \
+        # Auto-inject FROM based on --claude/--opencode. Strip any existing
+        # FROM from the user's Dockerfile.codebox.
+        {
+            echo "FROM ${RUN_IMAGE}"
+            if head -1 "$PROJECT_DOCKERFILE" | grep -qi '^FROM '; then
+                tail -n +2 "$PROJECT_DOCKERFILE"
+            else
+                cat "$PROJECT_DOCKERFILE"
+            fi
+        } | docker build \
             "${CACHE_ARG[@]}" \
+            --network=host \
+            --build-arg "USER_ID=$(id -u)" \
+            --build-arg "GROUP_ID=$(id -g)" \
             --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
             -t "$PROJECT_IMAGE" \
-            -f "$PROJECT_DOCKERFILE" \
+            -f - \
             "$TARGET_DIR"
     fi
     RUN_IMAGE="$PROJECT_IMAGE"
