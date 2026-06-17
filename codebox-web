@@ -230,7 +230,8 @@ init)
 #   Working directory = your project directory (mounted read-write)
 #   Credentials ~/.config/opencode = mounted from host
 #   Git config = mounted from host (~/.gitconfig, read-only)
-#   Tailscale socket = shared with sidecar for 'tailscale serve'
+#   Tailscale socket = /tmp/tailscaled.sock (shared with sidecar)
+#   Use tailscale CLI via: tailscale --socket /tmp/tailscaled.sock status
 #
 # Available as --build-arg: USER_ID (host uid), GROUP_ID (host gid).
 # Use them to chown files installed during build to match the runtime user:

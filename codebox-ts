@@ -169,7 +169,7 @@ RUN if [ "$TOOL" = "claude" ]; then \
     fi
 
 RUN printf '%s\n' '#!/bin/bash' \
-    'tailscaled --tun=userspace-networking --state=/home/sandbox/.cache/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &' \
+    'tailscaled --tun=userspace-networking --state=/home/sandbox/.cache/tailscaled.state --socket=/tmp/tailscaled.sock &' \
     'sleep 2' \
     '[ -n "\$TS_AUTH_KEY" ] && tailscale up --authkey="\$TS_AUTH_KEY" 2>/dev/null || true' \
     'exec "\${DEFAULT_TOOL:-claude}" "\$@"' > /entrypoint.sh \
