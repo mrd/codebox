@@ -478,8 +478,9 @@ init)
 # The base image is Debian trixie-slim with curl, git, ca-certificates
 # pre-installed. You have full apt access for additional packages.
 
-# Install system packages
+# Install system packages (socat, psmisc, procps, iproute2 are common)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    socat psmisc procps iproute2 \
     # add packages here (one per line) \
     && rm -rf /var/lib/apt/lists/*
 
@@ -493,6 +494,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Build step (example):
 # RUN make build
+
+# Tailnet TCP tunnel example (via socat + tailscale socket):
+#   socat TCP-LISTEN:15556,fork,reuseaddr \
+#         SYSTEM:"tailscale --socket /tmp/tailscaled.sock nc <PEER_IP> <PEER_PORT> 2>/dev/null" &
+# This forwards localhost:15556 to PEER_IP:PEER_PORT on the tailnet,
+# useful for ADB, HTTP APIs, or any TCP service on another tailscale node.
 DOCKERFILE
     echo "Wrote $DOCKERFILE" >&2
     ;;
