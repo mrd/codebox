@@ -25,6 +25,9 @@
 # Options:
 #   -r, --rebuild        Rebuild the Docker image(s) (uses layer cache)
 #   -R, --force-rebuild  Force rebuild the Docker image(s) ignoring cache
+#   --from IMAGE         Use IMAGE as the base Docker image instead of the
+#                        default debian:trixie-slim. The image must have curl,
+#                        bash, and ca-certificates available.
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
@@ -60,9 +63,13 @@
 #   target directory; forwarded keys are printed before the container starts.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
-# to add project-specific dependencies. It should start with:
+# to add project-specific dependencies. It can start with:
 #   FROM codebox          (Claude Code, the default)
 #   FROM codebox-opencode (with --opencode)
+#   FROM ubuntu:24.04     (any image — codebox installs the AI tool on top and
+#                          rewrites the FROM line to the resulting codebox image)
+# Using a third-party FROM in Dockerfile.codebox is equivalent to passing
+# --from with that image. The --from flag takes priority if both are given.
 # Building it runs arbitrary code and the resulting image controls the
 # container, so codebox prompts for confirmation before building a
 # Dockerfile.codebox from a directory you have not already trusted. Trust is
@@ -80,6 +87,8 @@ NO_GITCONFIG=false
 NO_DOCKERFILE=false
 USE_OPENCODE=false
 TRUST=false
+BASE_IMAGE="debian:trixie-slim"
+FROM_EXPLICIT=false
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -92,6 +101,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rebuild)        REBUILD=true; shift ;;
         -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
+        --from)              [[ $# -gt 1 ]] || { echo "error: --from requires an argument" >&2; exit 1; }
+                             BASE_IMAGE="$2"; FROM_EXPLICIT=true; shift 2 ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
@@ -116,6 +127,19 @@ if $USE_OPENCODE; then
     IMAGE_NAME="codebox-opencode"
 fi
 
+# If a non-default base image is requested, derive a unique image name so the
+# custom-base build doesn't overwrite (or be confused with) the default one.
+DEFAULT_BASE_IMAGE="debian:trixie-slim"
+_base_image_tag_suffix() {
+    if [[ "$BASE_IMAGE" != "$DEFAULT_BASE_IMAGE" ]]; then
+        local hash
+        hash="$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)"
+        echo "--base-${hash}"
+    fi
+}
+BASE_TAG_SUFFIX="$(_base_image_tag_suffix)"
+unset -f _base_image_tag_suffix
+
 if [[ ! -d "$TARGET_DIR" ]]; then
     echo "error: directory not found: $TARGET_DIR" >&2
     exit 1
@@ -128,10 +152,14 @@ CACHE_ARG=()
 $NO_CACHE && CACHE_ARG=(--no-cache)
 
 # Build base image if missing or rebuild requested
-if ! $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
-    echo "Building $IMAGE_NAME..." >&2
-    docker build "${CACHE_ARG[@]}" -t "$IMAGE_NAME" - <<'DOCKERFILE'
-FROM debian:trixie-slim
+BASE_IMAGE_NAME="${IMAGE_NAME}${BASE_TAG_SUFFIX}"
+if ! $USE_OPENCODE && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+    echo "Building $BASE_IMAGE_NAME..." >&2
+    docker build "${CACHE_ARG[@]}" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
@@ -150,10 +178,13 @@ ENTRYPOINT ["claude"]
 DOCKERFILE
 fi
 
-if $USE_OPENCODE && { $REBUILD || ! docker image inspect "$IMAGE_NAME" &>/dev/null; }; then
-    echo "Building $IMAGE_NAME..." >&2
-    docker build "${CACHE_ARG[@]}" -t "$IMAGE_NAME" - <<'DOCKERFILE'
-FROM debian:trixie-slim
+if $USE_OPENCODE && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+    echo "Building $BASE_IMAGE_NAME..." >&2
+    docker build "${CACHE_ARG[@]}" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
@@ -174,7 +205,72 @@ fi
 
 # Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
 PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
-RUN_IMAGE="$IMAGE_NAME"
+RUN_IMAGE="$BASE_IMAGE_NAME"
+
+# Extract FROM from Dockerfile.codebox: if it names a third-party image (not the
+# codebox base), use it as the base for the codebox build and rewrite the FROM
+# line to point at the resulting codebox base image before building the project
+# image. The --from flag takes priority over any FROM in Dockerfile.codebox.
+if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
+    _df_from="$(awk '/^[[:space:]]*FROM[[:space:]]/{ print $2; exit }' "$PROJECT_DOCKERFILE")"
+    if ! $FROM_EXPLICIT && [[ -n "$_df_from" ]] \
+            && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" ]]; then
+        BASE_IMAGE="$_df_from"
+        BASE_TAG_SUFFIX="$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)"
+        BASE_TAG_SUFFIX="--base-${BASE_TAG_SUFFIX}"
+        BASE_IMAGE_NAME="${IMAGE_NAME}${BASE_TAG_SUFFIX}"
+        RUN_IMAGE="$BASE_IMAGE_NAME"
+        # Build (or rebuild) the codebox base on top of the extracted base image.
+        if $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; then
+            echo "Building $BASE_IMAGE_NAME from $BASE_IMAGE (extracted from Dockerfile.codebox)..." >&2
+            if $USE_OPENCODE; then
+                docker build "${CACHE_ARG[@]}" \
+                    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+                    -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://opencode.ai/install | bash
+
+ENTRYPOINT ["opencode"]
+DOCKERFILE
+            else
+                docker build "${CACHE_ARG[@]}" \
+                    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+                    -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENTRYPOINT ["claude"]
+DOCKERFILE
+            fi
+        fi
+    fi
+fi
 
 if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
@@ -210,12 +306,29 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
         --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
     if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
         echo "Building project image for $TARGET_DIR..." >&2
+
+        # When a non-default base image is in use (--from or FROM extracted from
+        # Dockerfile.codebox), rewrite the first FROM line to name the actual
+        # codebox base image that was just built so the project layers compose
+        # correctly.
+        EFFECTIVE_DOCKERFILE="$PROJECT_DOCKERFILE"
+        TEMP_DOCKERFILE=""
+        if [[ "$BASE_IMAGE_NAME" != "$IMAGE_NAME" ]]; then
+            TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
+            awk -v img="$BASE_IMAGE_NAME" \
+                'done || !/^[[:space:]]*FROM[[:space:]]/{print; next} {print "FROM " img; done=1}' \
+                "$PROJECT_DOCKERFILE" > "$TEMP_DOCKERFILE"
+            EFFECTIVE_DOCKERFILE="$TEMP_DOCKERFILE"
+        fi
+
         docker build \
             "${CACHE_ARG[@]}" \
             --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
             -t "$PROJECT_IMAGE" \
-            -f "$PROJECT_DOCKERFILE" \
+            -f "$EFFECTIVE_DOCKERFILE" \
             "$TARGET_DIR"
+
+        [[ -n "$TEMP_DOCKERFILE" ]] && rm -f "$TEMP_DOCKERFILE"
     fi
     RUN_IMAGE="$PROJECT_IMAGE"
 fi
