@@ -36,6 +36,7 @@
 #   --trust              Trust this directory's Dockerfile.codebox without
 #                        prompting (needed for non-interactive use)
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
+#   --init               Generate a Dockerfile.codebox template in DIR
 #   -h, --help           Show this help
 #
 # DIR defaults to the current working directory.
@@ -89,6 +90,7 @@ USE_OPENCODE=false
 TRUST=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
+ACTION="up"
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -108,6 +110,7 @@ while [[ $# -gt 0 ]]; do
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
         --opencode)          USE_OPENCODE=true; shift ;;
+        --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
         -*)           echo "Unknown option: $1" >&2; exit 1 ;;
@@ -143,6 +146,53 @@ unset -f _base_image_tag_suffix
 if [[ ! -d "$TARGET_DIR" ]]; then
     echo "error: directory not found: $TARGET_DIR" >&2
     exit 1
+fi
+
+if [[ "$ACTION" == "init" ]]; then
+    DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
+    if [[ -f "$DOCKERFILE" ]]; then
+        echo "error: $DOCKERFILE already exists" >&2
+        exit 1
+    fi
+    if $USE_OPENCODE; then
+        FROM_LINE="FROM codebox-opencode"
+    else
+        FROM_LINE="FROM codebox"
+    fi
+    cat > "$DOCKERFILE" <<DOCKERFILE
+# Dockerfile.codebox — project dependencies for codebox
+# ======================================================
+# Your coding agent (Claude/OpenCode) can edit or recreate this file to
+# pre-install system packages, language runtimes, and project deps.
+#
+# The FROM line below uses the codebox base image. You can replace it with
+# any Docker image (e.g. FROM ubuntu:24.04) and codebox will install the AI
+# tool on top automatically.
+#
+# Container context:
+#   HOME = /home/sandbox
+#   USER = your host uid:gid (e.g. $(id -u):$(id -g))
+#   Working directory = your project directory (mounted read-write)
+#   Credentials ~/.claude or ~/.config/opencode = mounted from host
+#   Git config = mounted from host (~/.gitconfig, read-only)
+
+${FROM_LINE}
+
+# Install system packages
+# RUN apt-get update && apt-get install -y --no-install-recommends \\
+#     socat psmisc procps iproute2 \\
+#     && rm -rf /var/lib/apt/lists/*
+
+# Install language runtimes (examples):
+# RUN curl -fsSL https://astral.sh/uv/install.sh | sh
+# RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs
+
+# Install project dependencies (examples):
+# RUN uv sync
+# RUN npm install
+DOCKERFILE
+    echo "Wrote $DOCKERFILE" >&2
+    exit 0
 fi
 
 # Build cache flag (empty unless cache-busting was requested). Using an array
