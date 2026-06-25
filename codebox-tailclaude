@@ -80,7 +80,11 @@
 #
 # Environment:
 #   TS_AUTH_KEY           Tailscale auth key (get one at
-#                         https://login.tailscale.com/admin/settings/authkeys)
+#                         https://login.tailscale.com/admin/settings/authkeys).
+#                         May also be set in .env.codebox: it is used for the
+#                         tailscale sidecar but is NOT forwarded into the agent
+#                         container. TS_EXTRA_ARGS is treated the same way.
+#   TS_EXTRA_ARGS         Extra args passed to the tailscale sidecar's `up`
 #   ANTHROPIC_API_KEY     Anthropic API key (required without credentials mount)
 #   ANTHROPIC_BASE_URL    Anthropic API base URL (default: https://api.anthropic.com)
 ################################################################################
@@ -238,6 +242,10 @@ build_tool_command() {
 generate_env_codebox_yaml() {
     local env_file="$TARGET_DIR/.env.codebox"
     local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR")
+    # Keys consumed by the tailscale sidecar via compose substitution. They are
+    # still exported by export_env_codebox (so ${KEY:-} resolves for the sidecar)
+    # but must NOT be forwarded into the agent container's environment.
+    local noforward=("TS_AUTH_KEY" "TS_EXTRA_ARGS")
     local result=""
 
     if [[ ! -f "$env_file" ]]; then
@@ -256,6 +264,14 @@ generate_env_codebox_yaml() {
         done
         if $blocked; then
             echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
+            continue
+        fi
+        local skip=false
+        for b in "${noforward[@]}"; do
+            [[ "$key" == "$b" ]] && { skip=true; break; }
+        done
+        if $skip; then
+            echo "using '$key' from .env.codebox for tailscale sidecar (not forwarded to agent)" >&2
             continue
         fi
         echo "forwarding env from .env.codebox: $key" >&2
