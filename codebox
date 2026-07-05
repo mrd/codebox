@@ -30,6 +30,9 @@
 #                        bash, and ca-certificates available.
 #   --no-credentials     Do not mount credential/config directories; requires
 #                        ANTHROPIC_API_KEY for auth
+#   --mount HOST:CONTAINER
+#                        Additional bind mount (can be repeated; also reads
+#                        CODEBOX_MOUNTS from .env.codebox)
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile      Ignore the directory's Dockerfile.codebox and run the
 #                        base image instead
@@ -62,6 +65,8 @@
 #   Sensitive keys (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
 #   CLAUDE_CONFIG_DIR) are refused since .env.codebox may come from an untrusted
 #   target directory; forwarded keys are printed before the container starts.
+#   CODEBOX_MOUNTS is treated as a space-separated list of HOST:CONTAINER mount
+#   specifications and is forwarded as extra bind mounts.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
@@ -91,6 +96,7 @@ TRUST=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
 ACTION="up"
+EXTRA_MOUNTS=()
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -109,6 +115,8 @@ while [[ $# -gt 0 ]]; do
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
+        --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
+                             EXTRA_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
@@ -422,6 +430,25 @@ if [[ -f "$ENV_FILE" ]]; then
         echo "forwarding env from .env.codebox: $key" >&2
         ENV_ARGS+=(-e "${key}=${value}")
     done < "$ENV_FILE"
+
+    # Extra mounts from CODEBOX_MOUNTS in .env.codebox
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ "$key" != "CODEBOX_MOUNTS" ]] && continue
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value#\"}"; value="${value%\"}"
+        value="${value#\'}"; value="${value%\'}"
+        if [[ -n "$value" ]]; then
+            while IFS=' ' read -ra mounts; do
+                for m in "${mounts[@]}"; do
+                    [[ -n "$m" ]] && EXTRA_MOUNTS+=("$m")
+                done
+            done <<< "$value"
+        fi
+        break
+    done < "$ENV_FILE"
 fi
 
 # Credential/config mounts.
@@ -480,6 +507,11 @@ CONTAINER_NAME="codebox-$(id -u)-$$"
 # container. Repeat for as many Ctrl-Z / fg cycles as the user likes.
 container_running() { docker container inspect "$CONTAINER_NAME" &>/dev/null; }
 
+EXTRA_VOLUME_ARGS=()
+for m in "${EXTRA_MOUNTS[@]}"; do
+    EXTRA_VOLUME_ARGS+=(-v "$m")
+done
+
 docker run --rm -it \
     --name "$CONTAINER_NAME" \
     --detach-keys "ctrl-z" \
@@ -489,6 +521,7 @@ docker run --rm -it \
     -v "$TARGET_DIR:$TARGET_DIR" \
     "${CRED_MOUNTS[@]}" \
     "${GITCONFIG_MOUNTS[@]}" \
+    "${EXTRA_VOLUME_ARGS[@]}" \
     -w "$TARGET_DIR" \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \
