@@ -1,6 +1,6 @@
 # codebox
 
-Run Claude Code or OpenCode in an isolated Docker container. Your project directory is mounted read-write, but the container has no access to the rest of your host filesystem.
+Run Claude Code, OpenCode, or OpenAI Codex in an isolated Docker container. Your project directory is mounted read-write, but the container has no access to the rest of your host filesystem.
 
 ## Requirements
 
@@ -22,17 +22,20 @@ Make sure `~/.local/bin` is in your `PATH`.
 codebox [OPTIONS] [DIR] [-- ARGS...]
 ```
 
-`DIR` defaults to the current working directory. `ARGS` are passed through to `claude` or `opencode`.
+`DIR` defaults to the current working directory. `ARGS` are passed through to `claude`, `opencode`, or `codex`.
 
 **Options:**
 
 | Flag | Description |
 |------|-------------|
 | `-r`, `--rebuild` | Force rebuild of the Docker image(s) |
-| `--no-credentials` | Skip mounting credential/config directories; requires `ANTHROPIC_API_KEY` |
+| `--no-credentials` | Skip mounting credential/config directories; requires `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) |
 | `--no-dockerfile` | Ignore the project's `Dockerfile.codebox` and run the base image instead |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
+| `--codex` | Use [OpenAI Codex](https://chatgpt.com/codex) instead of Claude Code |
 | `-h`, `--help` | Show help |
+
+`--opencode` and `--codex` are mutually exclusive.
 
 **Examples:**
 
@@ -42,6 +45,9 @@ codebox
 
 # Run OpenCode in the current directory
 codebox --opencode
+
+# Run OpenAI Codex in the current directory
+codebox --codex
 
 # Run in a specific project
 codebox ~/src/myproject
@@ -62,10 +68,11 @@ The first run builds a base Docker image from the bundled `Dockerfile`. The imag
 
 - **Claude Code** (default): base image `codebox`, mounts `~/.claude` and `~/.claude.json` read-write so login state and preferences persist across runs.
 - **OpenCode** (`--opencode`): base image `codebox-opencode`, mounts `~/.config/opencode` read-write so configuration persists across runs.
+- **OpenAI Codex** (`--codex`): base image `codebox-codex`, mounts your host `~/.codex` read-write (via `CODEX_HOME`) so login state (`auth.json`) and config persist across runs. (Codex installs its own binary under `~/.codex`, so codebox points `CODEX_HOME` at a separate mount to avoid shadowing it.) Codex normally sandboxes the commands it runs (bubblewrap/Landlock), which needs an unprivileged user namespace and can't work inside codebox's hardened container — so codebox runs Codex with `-s danger-full-access` to disable that redundant inner sandbox (the container is the sandbox; approval prompts stay on). Pass your own `-s`/`--sandbox`/`--full-auto`/`--dangerously-bypass-approvals-and-sandbox` to override.
 
-In both cases the container runs as your host user (`uid:gid`), so files written inside are owned by you.
+In all cases the container runs as your host user (`uid:gid`), so files written inside are owned by you.
 
-To avoid exposing credentials to the container, pass `--no-credentials` and authenticate via `ANTHROPIC_API_KEY` instead.
+To avoid exposing credentials to the container, pass `--no-credentials` and authenticate via `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) instead.
 
 ## Project-specific images
 
@@ -76,6 +83,7 @@ If a project directory contains a `Dockerfile.codebox`, codebox builds a project
 ```dockerfile
 FROM codebox          # for Claude Code (default)
 FROM codebox-opencode # for --opencode
+FROM codebox-codex    # for --codex
 ```
 
 The project image is rebuilt automatically when the `Dockerfile.codebox` changes (detected by SHA-256). To force a rebuild, pass `-r`. To skip the project image entirely and run the base image, pass `--no-dockerfile`.

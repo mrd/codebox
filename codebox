@@ -39,19 +39,31 @@
 #   --trust              Trust this directory's Dockerfile.codebox without
 #                        prompting (needed for non-interactive use)
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
+#   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
 #   --init               Generate a Dockerfile.codebox template in DIR
 #   -h, --help           Show this help
 #
+# --opencode and --codex are mutually exclusive.
+#
+# Codex sandbox: Codex normally sandboxes the commands it runs (bubblewrap /
+#   Landlock), which needs an unprivileged user namespace and cannot work
+#   inside codebox's hardened container. Since the container is already the
+#   sandbox, codebox runs Codex with -s danger-full-access to disable that
+#   inner sandbox (approval prompts stay on). Pass your own -s/--sandbox,
+#   --full-auto, or --dangerously-bypass-approvals-and-sandbox to override.
+#
 # DIR defaults to the current working directory.
-# ARGS are passed through to `claude` or `opencode`.
+# ARGS are passed through to `claude`, `opencode`, or `codex`.
 #
 # Credential mounts (default):
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
 #   OpenCode:    ~/.config/opencode mounted read-write.
+#   Codex:       ~/.codex mounted read-write.
 #   With --no-credentials a dedicated sandbox config dir is mounted instead of
-#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox), so no
-#   host login state or host-executed hooks are exposed. Auth via
-#   ANTHROPIC_API_KEY in that case.
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox /
+#   ~/.codex-codebox), so no host login state or host-executed hooks are
+#   exposed. Auth via ANTHROPIC_API_KEY (or OPENAI_API_KEY for Codex) in that
+#   case.
 #
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
 #   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
@@ -72,6 +84,7 @@
 # to add project-specific dependencies. It can start with:
 #   FROM codebox          (Claude Code, the default)
 #   FROM codebox-opencode (with --opencode)
+#   FROM codebox-codex    (with --codex)
 #   FROM ubuntu:24.04     (any image — codebox installs the AI tool on top and
 #                          rewrites the FROM line to the resulting codebox image)
 # Using a third-party FROM in Dockerfile.codebox is equivalent to passing
@@ -92,6 +105,7 @@ NO_CREDS=false
 NO_GITCONFIG=false
 NO_DOCKERFILE=false
 USE_OPENCODE=false
+USE_CODEX=false
 TRUST=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
@@ -118,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
                              EXTRA_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
+        --codex)             USE_CODEX=true; shift ;;
         --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
@@ -134,8 +149,15 @@ if ! $AFTER_DASHDASH; then
 fi
 TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
 
+if $USE_OPENCODE && $USE_CODEX; then
+    echo "error: --opencode and --codex are mutually exclusive" >&2
+    exit 1
+fi
+
 if $USE_OPENCODE; then
     IMAGE_NAME="codebox-opencode"
+elif $USE_CODEX; then
+    IMAGE_NAME="codebox-codex"
 fi
 
 # If a non-default base image is requested, derive a unique image name so the
@@ -164,6 +186,8 @@ if [[ "$ACTION" == "init" ]]; then
     fi
     if $USE_OPENCODE; then
         FROM_LINE="FROM codebox-opencode"
+    elif $USE_CODEX; then
+        FROM_LINE="FROM codebox-codex"
     else
         FROM_LINE="FROM codebox"
     fi
@@ -211,7 +235,7 @@ $NO_CACHE && CACHE_ARG=(--no-cache)
 
 # Build base image if missing or rebuild requested
 BASE_IMAGE_NAME="${IMAGE_NAME}${BASE_TAG_SUFFIX}"
-if ! $USE_OPENCODE && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+if ! $USE_OPENCODE && ! $USE_CODEX && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
     echo "Building $BASE_IMAGE_NAME..." >&2
     docker build "${CACHE_ARG[@]}" \
         --build-arg "BASE_IMAGE=$BASE_IMAGE" \
@@ -261,6 +285,31 @@ ENTRYPOINT ["opencode"]
 DOCKERFILE
 fi
 
+if $USE_CODEX && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+    echo "Building $BASE_IMAGE_NAME..." >&2
+    docker build "${CACHE_ARG[@]}" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
+
+ENTRYPOINT ["codex"]
+DOCKERFILE
+fi
+
 # Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
 PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
 RUN_IMAGE="$BASE_IMAGE_NAME"
@@ -272,7 +321,7 @@ RUN_IMAGE="$BASE_IMAGE_NAME"
 if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     _df_from="$(awk '/^[[:space:]]*FROM[[:space:]]/{ print $2; exit }' "$PROJECT_DOCKERFILE")"
     if ! $FROM_EXPLICIT && [[ -n "$_df_from" ]] \
-            && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" ]]; then
+            && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" && "$_df_from" != "codebox-codex" ]]; then
         BASE_IMAGE="$_df_from"
         BASE_TAG_SUFFIX="$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)"
         BASE_TAG_SUFFIX="--base-${BASE_TAG_SUFFIX}"
@@ -302,6 +351,28 @@ ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://opencode.ai/install | bash
 
 ENTRYPOINT ["opencode"]
+DOCKERFILE
+            elif $USE_CODEX; then
+                docker build "${CACHE_ARG[@]}" \
+                    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+                    -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
+
+ENTRYPOINT ["codex"]
 DOCKERFILE
             else
                 docker build "${CACHE_ARG[@]}" \
@@ -393,9 +464,13 @@ fi
 
 # Collect env vars to forward
 ENV_ARGS=()
-ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL)
-if ! $USE_OPENCODE; then
-    ENV_VARS+=(CLAUDE_CONFIG_DIR)
+if $USE_CODEX; then
+    ENV_VARS=(OPENAI_API_KEY OPENAI_BASE_URL)
+else
+    ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL)
+    if ! $USE_OPENCODE; then
+        ENV_VARS+=(CLAUDE_CONFIG_DIR)
+    fi
 fi
 for var in "${ENV_VARS[@]}"; do
     if [[ -n "${!var:-}" ]]; then
@@ -410,7 +485,7 @@ done
 # relocate the config dir — e.g. ANTHROPIC_BASE_URL pointing at an attacker host
 # would exfiltrate the API key / OAuth token in request headers. Forwarded keys
 # are printed so they are visible before the container starts.
-ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR)
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME)
 ENV_FILE="$TARGET_DIR/.env.codebox"
 if [[ -f "$ENV_FILE" ]]; then
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
@@ -460,7 +535,21 @@ fi
 # mounted read-write. Pointing the container at a separate dir keeps cross-run
 # persistence for the sandbox without exposing host login state or letting the
 # sandbox write host-executed hooks. Auth is then expected via ANTHROPIC_API_KEY.
-if $USE_OPENCODE; then
+if $USE_CODEX; then
+    if $NO_CREDS; then
+        CODEX_CONFIG_HOST_DIR="${HOME}/.codex-codebox"
+    else
+        CODEX_CONFIG_HOST_DIR="${HOME}/.codex"
+    fi
+    mkdir -p "$CODEX_CONFIG_HOST_DIR"
+    # Codex installs its own binary under /home/sandbox/.codex (the codex on
+    # PATH symlinks into .codex/packages), so we cannot mount the host's
+    # ~/.codex there without shadowing the binary. Instead mount it at a
+    # separate path and point CODEX_HOME at it, which relocates just the
+    # config/auth (auth.json, config.toml, history) and leaves the binary intact.
+    CRED_MOUNTS=(-v "$CODEX_CONFIG_HOST_DIR:/home/sandbox/.codex-home")
+    ENV_ARGS+=(-e "CODEX_HOME=/home/sandbox/.codex-home")
+elif $USE_OPENCODE; then
     if $NO_CREDS; then
         OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode-codebox"
     else
@@ -511,6 +600,28 @@ EXTRA_VOLUME_ARGS=()
 for m in "${EXTRA_MOUNTS[@]}"; do
     EXTRA_VOLUME_ARGS+=(-v "$m")
 done
+
+# Codex sandboxes model-generated commands itself (bubblewrap/Landlock, which
+# needs an unprivileged user namespace). That can't work inside codebox's
+# container -- we run with --cap-drop ALL and --security-opt no-new-privileges,
+# so bwrap fails with "No permissions to create a new namespace". codebox's
+# container is already the sandbox, so disable Codex's redundant inner sandbox
+# with -s danger-full-access. Approval prompts are left on (like Claude here),
+# so the agent still asks before running commands. Skip if the user already
+# passed a sandbox/autonomy flag so their choice wins.
+if $USE_CODEX; then
+    _has_sandbox_flag=false
+    for a in "$@"; do
+        case "$a" in
+            -s|--sandbox|--full-auto|--dangerously-bypass-approvals-and-sandbox)
+                _has_sandbox_flag=true; break ;;
+        esac
+    done
+    if ! $_has_sandbox_flag; then
+        echo "codex: disabling Codex's inner sandbox (-s danger-full-access); codebox's container is the sandbox" >&2
+        set -- -s danger-full-access "$@"
+    fi
+fi
 
 docker run --rm -it \
     --name "$CONTAINER_NAME" \
