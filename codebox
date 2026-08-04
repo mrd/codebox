@@ -32,12 +32,17 @@
 #                        ANTHROPIC_API_KEY for auth
 #   --mount HOST:CONTAINER
 #                        Additional bind mount (can be repeated; also reads
-#                        CODEBOX_MOUNTS from .env.codebox)
+#                        CODEBOX_MOUNTS from .env.codebox). As a shorthand,
+#                        :PATH mounts PATH at the same path in the container
+#                        (:/data is equivalent to /data:/data, and options may
+#                        be appended as :/data:ro)
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile      Ignore the directory's Dockerfile.codebox and run the
 #                        base image instead
 #   --trust              Trust this directory's Dockerfile.codebox without
 #                        prompting (needed for non-interactive use)
+#   --allow-home         Allow DIR to be your home directory (or an ancestor of
+#                        it) without prompting; this exposes everything under it
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
 #   --init               Generate a Dockerfile.codebox template in DIR
@@ -78,7 +83,8 @@
 #   CLAUDE_CONFIG_DIR) are refused since .env.codebox may come from an untrusted
 #   target directory; forwarded keys are printed before the container starts.
 #   CODEBOX_MOUNTS is treated as a space-separated list of HOST:CONTAINER mount
-#   specifications and is forwarded as extra bind mounts.
+#   specifications and is forwarded as extra bind mounts. The :PATH identity
+#   shorthand accepted by --mount works here too.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
@@ -107,6 +113,7 @@ NO_DOCKERFILE=false
 USE_OPENCODE=false
 USE_CODEX=false
 TRUST=false
+ALLOW_HOME=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
 ACTION="up"
@@ -129,6 +136,7 @@ while [[ $# -gt 0 ]]; do
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
+        --allow-home)        ALLOW_HOME=true; shift ;;
         --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
                              EXTRA_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
@@ -148,6 +156,33 @@ if ! $AFTER_DASHDASH; then
     shift 2>/dev/null || true
 fi
 TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
+
+# The target directory is mounted read-write, so making it your home directory
+# (or an ancestor of it) hands the agent ~/.ssh, ~/.gnupg, ~/.aws, browser
+# profiles and every other secret in there -- the opposite of what codebox is
+# for. This is easy to do by accident: a bare `codebox` in the wrong shell does
+# it. Confirm before proceeding.
+HOME_REAL="$(realpath "$HOME" 2>/dev/null || echo "$HOME")"
+_t="${TARGET_DIR%/}"
+if ! $ALLOW_HOME && [[ "$HOME_REAL" == "$_t" || "$HOME_REAL" == "$_t"/* ]]; then
+    if [[ "$HOME_REAL" == "$_t" ]]; then
+        echo "warning: $TARGET_DIR is your home directory." >&2
+    else
+        echo "warning: $TARGET_DIR contains your home directory ($HOME_REAL)." >&2
+    fi
+    echo "  It is mounted read-write, so the agent gets your ssh keys, cloud" >&2
+    echo "  credentials and everything else under it. Prefer a project directory." >&2
+    if [[ ! -t 0 ]]; then
+        echo "error: refusing to mount your home directory without a tty." >&2
+        echo "       Re-run with --allow-home if this is really what you want." >&2
+        exit 1
+    fi
+    read -r -p "Mount it anyway? [y/N] " ans
+    if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+        echo "Aborted." >&2
+        exit 1
+    fi
+fi
 
 if $USE_OPENCODE && $USE_CODEX; then
     echo "error: --opencode and --codex are mutually exclusive" >&2
@@ -596,8 +631,29 @@ CONTAINER_NAME="codebox-$(id -u)-$$"
 # container. Repeat for as many Ctrl-Z / fg cycles as the user likes.
 container_running() { docker container inspect "$CONTAINER_NAME" &>/dev/null; }
 
+# A mount spec starting with ':' is shorthand for an identity mount: the host
+# path is mounted at the same path inside the container, the way the target
+# directory itself is. ":PATH" becomes "PATH:PATH" and any trailing docker
+# options are kept, so ":/data:ro" becomes "/data:/data:ro". The path is
+# resolved (like TARGET_DIR) so relative shorthands such as ":../sibling" work.
 EXTRA_VOLUME_ARGS=()
 for m in "${EXTRA_MOUNTS[@]}"; do
+    if [[ "$m" == :* ]]; then
+        spec="${m#:}"
+        mpath="${spec%%:*}"
+        mopts="${spec#"$mpath"}"
+        [[ -n "$mpath" ]] || { echo "error: --mount '$m': ':' shorthand requires a path (:PATH[:OPTIONS])" >&2; exit 1; }
+        mpath="$(realpath "$mpath" 2>/dev/null)" || { echo "error: --mount '$m': no such path: ${spec%%:*}" >&2; exit 1; }
+        m="${mpath}:${mpath}${mopts}"
+    fi
+    # A spec with no ':' is a docker *anonymous volume* -- an empty directory
+    # that silently discards its contents when the container exits. Nobody
+    # wants that from --mount, and it reads like a bind mount, so reject it.
+    if [[ "$m" != *:* ]]; then
+        echo "error: --mount '$m': missing ':'" >&2
+        echo "       Use HOST:CONTAINER, or ':$m' to mount it at the same path." >&2
+        exit 1
+    fi
     EXTRA_VOLUME_ARGS+=(-v "$m")
 done
 

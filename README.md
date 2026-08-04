@@ -31,6 +31,8 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `-r`, `--rebuild` | Force rebuild of the Docker image(s) |
 | `--no-credentials` | Skip mounting credential/config directories; requires `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) |
 | `--no-dockerfile` | Ignore the project's `Dockerfile.codebox` and run the base image instead |
+| `--mount HOST:CONTAINER` | Additional bind mount; repeatable. `:PATH` is shorthand for an identity mount (`:/data` = `/data:/data`), with options appended as `:/data:ro`. Also reads `CODEBOX_MOUNTS` from `.env.codebox` |
+| `--allow-home` | Skip the confirmation prompt when the target directory is your home directory (or an ancestor of it) |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
 | `--codex` | Use [OpenAI Codex](https://chatgpt.com/codex) instead of Claude Code |
 | `-h`, `--help` | Show help |
