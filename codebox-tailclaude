@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 ################################################################################
 #
-# codebox-tailclaude - Run Claude Code or OpenCode TUI in a Docker container
-#                      with a Tailscale sidecar, joining your tailnet.
+# codebox-tailclaude - Run Claude Code, OpenCode or Codex TUI in a Docker
+#                      container with a Tailscale sidecar, joining your tailnet.
 # Copyright (C) 2026 Matthew Danish
 #
 # This program is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@
 #
 # Usage: codebox-tailclaude [OPTIONS] [DIR] [-- ARGS...]
 #
-# Run Claude Code or OpenCode TUI in an isolated Docker container with a
+# Run Claude Code, OpenCode or Codex TUI in an isolated Docker container with a
 # Tailscale sidecar, so the container joins your tailnet. The project
 # directory is mounted read-write into the container.
 #
@@ -31,11 +31,14 @@
 #   -R, --force-rebuild   Rebuild the base image ignoring cache
 #   --claude              Use Claude Code (default)
 #   --opencode            Use OpenCode instead of Claude Code
+#   --codex               Use OpenAI Codex (chatgpt.com/codex) instead of Claude
 #   --no-credentials      Do not mount credential/config directories; requires
 #                         ANTHROPIC_API_KEY for auth
 #   --no-gitconfig        Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile       Ignore Dockerfile.codebox and use base image
 #   --trust               Trust Dockerfile.codebox without prompting
+#   --allow-home          Allow DIR to be your home directory (or an ancestor of
+#                         it) without prompting; this exposes everything under it
 #   -d, --detach          Run in background (default: foreground)
 #   --stop                Stop and remove containers (preserves config volumes)
 #   --logs                Follow logs
@@ -48,19 +51,33 @@
 #                         directory (explains mounts, working dir, etc.)
 #   --mount HOST:CONTAINER
 #                         Additional bind mount (can be repeated; also reads
-#                         CODEBOX_MOUNTS from .env.codebox)
+#                         CODEBOX_MOUNTS from .env.codebox). As a shorthand,
+#                         :PATH mounts PATH at the same path in the container
+#                         (:/data is equivalent to /data:/data, and options may
+#                         be appended as :/data:ro)
 #   -h, --help            Show this help
 #
+# --opencode and --codex are mutually exclusive.
+#
+# Codex sandbox: Codex normally sandboxes the commands it runs (bubblewrap /
+#   Landlock), which needs an unprivileged user namespace and cannot be relied
+#   on inside the container. Since the container is already the sandbox,
+#   codebox-tailclaude runs Codex with -s danger-full-access to disable that
+#   inner sandbox (approval prompts stay on). Pass your own -s/--sandbox,
+#   --full-auto, or --dangerously-bypass-approvals-and-sandbox to override.
+#
 # DIR defaults to the current working directory.
-# ARGS are passed through to claude or opencode.
+# ARGS are passed through to claude, opencode or codex.
 #
 # Credential mounts (default):
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
 #   OpenCode:    ~/.config/opencode mounted read-write.
+#   Codex:       ~/.codex mounted read-write.
 #   With --no-credentials a dedicated sandbox config dir is mounted instead of
-#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox), so no
-#   host login state or host-executed hooks are exposed. Auth via
-#   ANTHROPIC_API_KEY in that case.
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox /
+#   ~/.codex-codebox), so no host login state or host-executed hooks are
+#   exposed. Auth via ANTHROPIC_API_KEY (or OPENAI_API_KEY for Codex) in that
+#   case.
 #
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
 #   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
@@ -71,7 +88,8 @@
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. The FROM line is auto-injected based
-# on --claude/--opencode, so the Dockerfile.codebox should NOT start with FROM.
+# on --claude/--opencode/--codex, so the Dockerfile.codebox should NOT start
+# with FROM.
 # Building it runs arbitrary code and the resulting image controls the
 # container, so codebox-tailclaude prompts for confirmation before building a
 # Dockerfile.codebox from a directory you have not already trusted. Trust is
@@ -87,6 +105,12 @@
 #   TS_EXTRA_ARGS         Extra args passed to the tailscale sidecar's `up`
 #   ANTHROPIC_API_KEY     Anthropic API key (required without credentials mount)
 #   ANTHROPIC_BASE_URL    Anthropic API base URL (default: https://api.anthropic.com)
+#   OPENAI_API_KEY        OpenAI API key for Codex (with --codex)
+#   OPENAI_BASE_URL       OpenAI API base URL (with --codex)
+#   CODEBOX_MOUNTS        Space-separated list of HOST:CONTAINER mount
+#                         specifications in .env.codebox, forwarded as extra
+#                         bind mounts. The :PATH identity shorthand accepted by
+#                         --mount works here too.
 ################################################################################
 
 set -euo pipefail
@@ -99,10 +123,12 @@ usage() {
 REBUILD=false
 NO_CACHE=false
 USE_OPENCODE=false
+USE_CODEX=false
 NO_CREDS=false
 NO_GITCONFIG=false
 NO_DOCKERFILE=false
 TRUST=false
+ALLOW_HOME=false
 DETACH=false
 ACTION="up"
 AFTER_DASHDASH=false
@@ -115,12 +141,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -r|--rebuild)        REBUILD=true; shift ;;
         -R|--force-rebuild)  REBUILD=true; NO_CACHE=true; shift ;;
-        --claude)            USE_OPENCODE=false; shift ;;
+        --claude)            USE_OPENCODE=false; USE_CODEX=false; shift ;;
         --opencode)          USE_OPENCODE=true;  shift ;;
+        --codex)             USE_CODEX=true; shift ;;
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
         --trust)             TRUST=true; shift ;;
+        --allow-home)        ALLOW_HOME=true; shift ;;
         -d|--detach)         DETACH=true; shift ;;
         --stop)              ACTION="stop"; shift ;;
         --logs)              ACTION="logs"; shift ;;
@@ -129,7 +157,8 @@ while [[ $# -gt 0 ]]; do
         --https)             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
         --http)              SERVE_HTTP=true; shift ;;
         --init)              ACTION="init"; shift ;;
-        --mount)             EXTRA_MOUNTS+=("$2"); shift 2 ;;
+        --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
+                             EXTRA_MOUNTS+=("$2"); shift 2 ;;
         -h|--help)           usage ;;
         --)                  shift; AFTER_DASHDASH=true; break ;;
         -*)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -148,15 +177,71 @@ if [[ ! -d "$TARGET_DIR" ]]; then
     exit 1
 fi
 
+# The target directory is mounted read-write, so making it your home directory
+# (or an ancestor of it) hands the agent ~/.ssh, ~/.gnupg, ~/.aws, browser
+# profiles and every other secret in there -- the opposite of what codebox is
+# for. This is easy to do by accident: a bare `codebox-tailclaude` in the wrong
+# shell does it. Confirm before proceeding.
+HOME_REAL="$(realpath "$HOME" 2>/dev/null || echo "$HOME")"
+_t="${TARGET_DIR%/}"
+if ! $ALLOW_HOME && [[ "$HOME_REAL" == "$_t" || "$HOME_REAL" == "$_t"/* ]]; then
+    if [[ "$HOME_REAL" == "$_t" ]]; then
+        echo "warning: $TARGET_DIR is your home directory." >&2
+    else
+        echo "warning: $TARGET_DIR contains your home directory ($HOME_REAL)." >&2
+    fi
+    echo "  It is mounted read-write, so the agent gets your ssh keys, cloud" >&2
+    echo "  credentials and everything else under it. Prefer a project directory." >&2
+    if [[ ! -t 0 ]]; then
+        echo "error: refusing to mount your home directory without a tty." >&2
+        echo "       Re-run with --allow-home if this is really what you want." >&2
+        exit 1
+    fi
+    read -r -p "Mount it anyway? [y/N] " ans
+    if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+        echo "Aborted." >&2
+        exit 1
+    fi
+fi
+
+if $USE_OPENCODE && $USE_CODEX; then
+    echo "error: --opencode and --codex are mutually exclusive" >&2
+    exit 1
+fi
+
 # Remaining args are passed through to the tool
 TOOL_ARGS=("$@")
 
 if $USE_OPENCODE; then
     TOOL="opencode"
     BASE_IMAGE="codebox-opencode"
+elif $USE_CODEX; then
+    TOOL="codex"
+    BASE_IMAGE="codebox-codex"
 else
     TOOL="claude"
     BASE_IMAGE="codebox"
+fi
+
+# Codex sandboxes model-generated commands itself (bubblewrap/Landlock, which
+# needs an unprivileged user namespace). That cannot be relied on inside the
+# container, where bwrap fails with "No permissions to create a new namespace".
+# The container is already the sandbox, so disable Codex's redundant inner
+# sandbox with -s danger-full-access. Approval prompts are left on (like Claude
+# here), so the agent still asks before running commands. Skip if the user
+# already passed a sandbox/autonomy flag so their choice wins.
+if $USE_CODEX; then
+    _has_sandbox_flag=false
+    for a in "${TOOL_ARGS[@]}"; do
+        case "$a" in
+            -s|--sandbox|--full-auto|--dangerously-bypass-approvals-and-sandbox)
+                _has_sandbox_flag=true; break ;;
+        esac
+    done
+    if ! $_has_sandbox_flag; then
+        echo "codex: disabling Codex's inner sandbox (-s danger-full-access); the container is the sandbox" >&2
+        TOOL_ARGS=(-s danger-full-access "${TOOL_ARGS[@]}")
+    fi
 fi
 
 SUFFIX="$(echo "$TARGET_DIR" | sha256sum | cut -c1-8)"
@@ -187,6 +272,21 @@ RUN curl -fsSL https://opencode.ai/install | bash
 RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
     | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
 ENTRYPOINT ["opencode"]
+DOCKERFILE
+    elif $USE_CODEX; then
+        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+    | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
+ENTRYPOINT ["codex"]
 DOCKERFILE
     else
         docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
@@ -241,7 +341,8 @@ build_tool_command() {
 # ${KEY:-} variable reference syntax (values NOT inlined in the YAML).
 generate_env_codebox_yaml() {
     local env_file="$TARGET_DIR/.env.codebox"
-    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR")
+    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR"
+                     "OPENAI_API_KEY" "OPENAI_BASE_URL" "CODEX_HOME")
     # Keys consumed by the tailscale sidecar via compose substitution. They are
     # still exported by export_env_codebox (so ${KEY:-} resolves for the sidecar)
     # but must NOT be forwarded into the agent container's environment.
@@ -284,7 +385,8 @@ generate_env_codebox_yaml() {
 # up. Values stay in process memory, not in the compose YAML on disk.
 export_env_codebox() {
     local env_file="$TARGET_DIR/.env.codebox"
-    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR")
+    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR"
+                     "OPENAI_API_KEY" "OPENAI_BASE_URL" "CODEX_HOME")
     if [[ ! -f "$env_file" ]]; then
         return
     fi
@@ -305,6 +407,34 @@ export_env_codebox() {
         fi
         export "${key}=${value}"
     done < "$env_file"
+}
+
+# Turn a --mount / CODEBOX_MOUNTS spec into a HOST:CONTAINER[:OPTIONS] string.
+#
+# A spec starting with ':' is shorthand for an identity mount: the host path is
+# mounted at the same path inside the container, the way the target directory
+# itself is. ":PATH" becomes "PATH:PATH" and any trailing docker options are
+# kept, so ":/data:ro" becomes "/data:/data:ro". The path is resolved (like
+# TARGET_DIR) so relative shorthands such as ":../sibling" work.
+normalize_mount() {
+    local m="$1" spec mpath mopts
+    if [[ "$m" == :* ]]; then
+        spec="${m#:}"
+        mpath="${spec%%:*}"
+        mopts="${spec#"$mpath"}"
+        [[ -n "$mpath" ]] || { echo "error: --mount '$m': ':' shorthand requires a path (:PATH[:OPTIONS])" >&2; return 1; }
+        mpath="$(realpath "$mpath" 2>/dev/null)" || { echo "error: --mount '$m': no such path: ${spec%%:*}" >&2; return 1; }
+        m="${mpath}:${mpath}${mopts}"
+    fi
+    # A spec with no ':' is a docker *anonymous volume* -- an empty directory
+    # that silently discards its contents when the container exits. Nobody
+    # wants that from --mount, and it reads like a bind mount, so reject it.
+    if [[ "$m" != *:* ]]; then
+        echo "error: --mount '$m': missing ':'" >&2
+        echo "       Use HOST:CONTAINER, or ':$m' to mount it at the same path." >&2
+        return 1
+    fi
+    echo "$m"
 }
 
 generate_compose() {
@@ -340,6 +470,18 @@ CFG
             STATE_MOUNT="${HOME}/.local/state/opencode:/home/sandbox/.local/state/opencode"
             mkdir -p "${CONFIG_MOUNT%%:*}"
         fi
+    elif $USE_CODEX; then
+        # Codex installs its own binary under /home/sandbox/.codex (the codex on
+        # PATH symlinks into .codex/packages), so we cannot mount the host's
+        # ~/.codex there without shadowing the binary. Instead mount it at a
+        # separate path and point CODEX_HOME at it, which relocates just the
+        # config/auth (auth.json, config.toml, history) and leaves the binary intact.
+        if $NO_CREDS; then
+            CONFIG_MOUNT="${HOME}/.codex-codebox:/home/sandbox/.codex-home"
+        else
+            CONFIG_MOUNT="${HOME}/.codex:/home/sandbox/.codex-home"
+        fi
+        mkdir -p "${CONFIG_MOUNT%%:*}"
     else
         if $NO_CREDS; then
             CONFIG_MOUNT="${HOME}/.claude-codebox:/home/sandbox/.claude"
@@ -378,12 +520,18 @@ services:
       XDG_DATA_HOME: /tmp/.local/share
       XDG_CACHE_HOME: /tmp/.cache
       XDG_STATE_HOME: /tmp/.local/state
-$( [[ -z "${ANTHROPIC_API_KEY:-}" ]] || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}" )
-$( [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}" )
+$( if $USE_CODEX; then
+       [[ -z "${OPENAI_API_KEY:-}" ]]  || echo "      OPENAI_API_KEY: \${OPENAI_API_KEY:-}"
+       [[ -z "${OPENAI_BASE_URL:-}" ]] || echo "      OPENAI_BASE_URL: \${OPENAI_BASE_URL:-}"
+   else
+       [[ -z "${ANTHROPIC_API_KEY:-}" ]]  || echo "      ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}"
+       [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || echo "      ANTHROPIC_BASE_URL: \${ANTHROPIC_BASE_URL:-}"
+   fi )
       BROWSER: /bin/true
       TS_SOCKET: /tmp/tailscaled.sock
       OPENCODE_YOLO: "true"
-$( if ! $USE_OPENCODE && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
+$( $USE_CODEX && echo "      CODEX_HOME: /home/sandbox/.codex-home" )
+$( if ! $USE_OPENCODE && ! $USE_CODEX && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
 ${env_codebox}
     volumes:
       - ts-socket-${SUFFIX}:/tmp
@@ -393,7 +541,7 @@ $( $USE_OPENCODE && echo "      - ${STATE_MOUNT}" )
 EOF
 
     # Mount ~/.claude.json for Claude (not with --no-credentials)
-    if ! $USE_OPENCODE && ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
+    if ! $USE_OPENCODE && ! $USE_CODEX && ! $NO_CREDS && [[ -f "${HOME}/.claude.json" ]]; then
         echo "      - ${HOME}/.claude.json:/home/sandbox/.claude.json" >> "$COMPOSE_DIR/docker-compose.yml"
     fi
 
@@ -403,8 +551,10 @@ EOF
     fi
 
     # Extra mounts from --mount flags
+    local spec
     for m in "${EXTRA_MOUNTS[@]}"; do
-        echo "      - $m" >> "$COMPOSE_DIR/docker-compose.yml"
+        spec="$(normalize_mount "$m")" || exit 1
+        echo "      - \"${spec}\"" >> "$COMPOSE_DIR/docker-compose.yml"
     done
 
     # Extra mounts from CODEBOX_MOUNTS in .env.codebox
@@ -414,7 +564,9 @@ EOF
         if [[ -n "$env_mounts" ]]; then
             while IFS=' ' read -ra mounts; do
                 for m in "${mounts[@]}"; do
-                    echo "      - $m" >> "$COMPOSE_DIR/docker-compose.yml"
+                    [[ -n "$m" ]] || continue
+                    spec="$(normalize_mount "$m")" || exit 1
+                    echo "      - \"${spec}\"" >> "$COMPOSE_DIR/docker-compose.yml"
                 done
             done <<< "$env_mounts"
         fi
@@ -470,17 +622,18 @@ init)
     cat > "$DOCKERFILE" <<'DOCKERFILE'
 # Dockerfile.codebox — project dependencies for codebox-tailclaude
 # =================================================================
-# Your coding agent (Claude/OpenCode) can edit or recreate this file to
+# Your coding agent (Claude/OpenCode/Codex) can edit or recreate this file to
 # pre-install system packages, language runtimes, and project deps.
 #
 # No FROM line needed — the script auto-injects the correct base image
-# (codebox for Claude, codebox-opencode for OpenCode).
+# (codebox for Claude, codebox-opencode for OpenCode, codebox-codex for Codex).
 #
 # Container context:
 #   HOME = /home/sandbox
 #   USER = your host uid:gid (e.g. 1000:1000)
 #   Working directory = your project directory (mounted read-write)
-#   Credentials ~/.claude or ~/.config/opencode = mounted from host
+#   Credentials ~/.claude, ~/.config/opencode or ~/.codex-home (Codex,
+#   CODEX_HOME) = mounted from host
 #   Git config = mounted from host (~/.gitconfig, read-only)
 #   Tailscale socket = /tmp/tailscaled.sock (shared with sidecar)
 #   Use tailscale CLI via: tailscale --socket /tmp/tailscaled.sock status
@@ -557,7 +710,7 @@ up)
             --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
         if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
             echo "Building project image for $TARGET_DIR..." >&2
-            # Auto-inject the correct FROM line based on --claude/--opencode.
+            # Auto-inject the FROM line based on --claude/--opencode/--codex.
             # Strip any existing FROM from the user's Dockerfile.codebox.
             {
                 echo "FROM ${BASE_IMAGE}"
@@ -595,7 +748,10 @@ up)
                 echo "Tailnet IP: $IP" >&2
                 TOOL_CONTAINER="$(container_name)"
                 if [[ -n "$TOOL_CONTAINER" ]]; then
-                    echo "Run: docker exec -it $TOOL_CONTAINER ${TOOL}" >&2
+                    # The container runs `sleep infinity` in detach mode, so
+                    # TOOL_ARGS (including Codex's -s danger-full-access) are
+                    # only applied when the user execs the tool by hand.
+                    echo "Run: docker exec -it $TOOL_CONTAINER ${TOOL} ${TOOL_ARGS[*]}" >&2
                 fi
                 break
             fi
