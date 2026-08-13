@@ -471,13 +471,23 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
         echo "Building project image for $TARGET_DIR..." >&2
 
-        # When a non-default base image is in use (--from or FROM extracted from
-        # Dockerfile.codebox), rewrite the first FROM line to name the actual
-        # codebox base image that was just built so the project layers compose
-        # correctly.
+        # Compose the Dockerfile that is actually handed to docker build:
+        #
+        #   - Dockerfile.codebox has no FROM line (what --init writes, and what
+        #     the template documents): prepend one naming the codebox base image
+        #     that was just built, since docker needs a build stage.
+        #   - It has a FROM line and a non-default base image is in use (--from,
+        #     or a third-party FROM that was built into the codebox base above):
+        #     rewrite the first FROM line to name the actual codebox base image
+        #     so the project layers compose correctly.
         EFFECTIVE_DOCKERFILE="$PROJECT_DOCKERFILE"
         TEMP_DOCKERFILE=""
-        if [[ "$BASE_IMAGE_NAME" != "$IMAGE_NAME" ]]; then
+        if ! grep -qiE '^[[:space:]]*FROM[[:space:]]' "$PROJECT_DOCKERFILE"; then
+            TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
+            { printf 'FROM %s\n' "$BASE_IMAGE_NAME"; cat "$PROJECT_DOCKERFILE"; } \
+                > "$TEMP_DOCKERFILE"
+            EFFECTIVE_DOCKERFILE="$TEMP_DOCKERFILE"
+        elif [[ "$BASE_IMAGE_NAME" != "$IMAGE_NAME" ]]; then
             TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
             awk -v img="$BASE_IMAGE_NAME" \
                 'done || !/^[[:space:]]*FROM[[:space:]]/{print; next} {print "FROM " img; done=1}' \
