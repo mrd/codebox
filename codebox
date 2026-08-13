@@ -93,8 +93,15 @@
 #   FROM codebox-codex    (with --codex)
 #   FROM ubuntu:24.04     (any image — codebox installs the AI tool on top and
 #                          rewrites the FROM line to the resulting codebox image)
+#   (no FROM line)      (the codebox base image is prepended for you)
 # Using a third-party FROM in Dockerfile.codebox is equivalent to passing
 # --from with that image. The --from flag takes priority if both are given.
+# If Dockerfile.codebox declares ARG USER_ID or ARG GROUP_ID, codebox passes
+# the host uid/gid as build args, so build-time installs can be chowned to the
+# user the container runs as:
+#   ARG USER_ID
+#   ARG GROUP_ID
+#   RUN chown -R $USER_ID:$GROUP_ID /opt/android-sdk
 # Building it runs arbitrary code and the resulting image controls the
 # container, so codebox prompts for confirmation before building a
 # Dockerfile.codebox from a directory you have not already trusted. Trust is
@@ -242,6 +249,13 @@ if [[ "$ACTION" == "init" ]]; then
 #   Working directory = your project directory (mounted read-write)
 #   Credentials ~/.claude or ~/.config/opencode = mounted from host
 #   Git config = mounted from host (~/.gitconfig, read-only)
+#
+# Declare ARG USER_ID or ARG GROUP_ID below and codebox passes the host uid/gid
+# as build args, so files installed during the build can be chowned to the user
+# the container runs as:
+#   ARG USER_ID
+#   ARG GROUP_ID
+#   RUN chown -R \$USER_ID:\$GROUP_ID /opt/android-sdk
 
 ${FROM_LINE}
 
@@ -495,8 +509,25 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
             EFFECTIVE_DOCKERFILE="$TEMP_DOCKERFILE"
         fi
 
+        # The container runs as the host uid:gid, so a Dockerfile.codebox that
+        # installs into a root-owned directory needs those ids at build time to
+        # chown what it installed. Pass them only when the Dockerfile declares
+        # the matching ARG, because docker warns about build args that the
+        # Dockerfile never consumes.
+        PROJECT_BUILD_ARGS=()
+        for _arg in USER_ID GROUP_ID; do
+            if grep -qiE "^[[:space:]]*ARG[[:space:]]+${_arg}([[:space:]]|=|\$)" \
+                    "$EFFECTIVE_DOCKERFILE"; then
+                case "$_arg" in
+                    USER_ID)  PROJECT_BUILD_ARGS+=(--build-arg "USER_ID=$(id -u)") ;;
+                    GROUP_ID) PROJECT_BUILD_ARGS+=(--build-arg "GROUP_ID=$(id -g)") ;;
+                esac
+            fi
+        done
+
         docker build \
             "${CACHE_ARG[@]}" \
+            "${PROJECT_BUILD_ARGS[@]}" \
             --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
             -t "$PROJECT_IMAGE" \
             -f "$EFFECTIVE_DOCKERFILE" \
