@@ -417,7 +417,10 @@ RUN_IMAGE="$BASE_IMAGE_NAME"
 # line to point at the resulting codebox base image before building the project
 # image. The --from flag takes priority over any FROM in Dockerfile.codebox.
 if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
-    _df_from="$(awk '/^[[:space:]]*FROM[[:space:]]/{ print $2; exit }' "$PROJECT_DOCKERFILE")"
+    # FROM is case-insensitive and may carry flags such as --platform=..., so
+    # take the first field after FROM that is not a flag.
+    _df_from="$(awk 'tolower($1) == "from" { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit } }' \
+        "$PROJECT_DOCKERFILE")"
     if ! $FROM_EXPLICIT && [[ -n "$_df_from" ]] \
             && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" && "$_df_from" != "codebox-codex" ]]; then
         BASE_IMAGE="$_df_from"
@@ -501,12 +504,19 @@ fi
 
 if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
-    PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
+    # The tag includes the base image name, so switching --from (or the FROM
+    # line) between runs does not reuse a project image built on another base.
+    PROJECT_IMAGE="${BASE_IMAGE_NAME}--${DIR_HASH}"
     DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
+    # The project image is also rebuilt when the base image it was built on has
+    # been rebuilt since, e.g. to pick up a newer version of the agent.
+    BASE_ID="$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE_NAME" 2>/dev/null || true)"
 
     EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
         --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
-    if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
+    EXISTING_BASE_ID="$(docker image inspect "$PROJECT_IMAGE" \
+        --format '{{index .Config.Labels "codebox.base.id"}}' 2>/dev/null || true)"
+    if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" || "$EXISTING_BASE_ID" != "$BASE_ID" ]]; then
         echo "Building project image for $TARGET_DIR..." >&2
 
         # Compose the Dockerfile that is actually handed to docker build:
@@ -518,8 +528,12 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
         #     or a third-party FROM that was built into the codebox base above):
         #     rewrite the first FROM line to name the actual codebox base image
         #     so the project layers compose correctly.
+        #     Only the image name is replaced, so flags such as --platform and
+        #     an "AS stage" suffix are kept.
         EFFECTIVE_DOCKERFILE="$PROJECT_DOCKERFILE"
         TEMP_DOCKERFILE=""
+        # Remove the temporary Dockerfile even when the build fails.
+        trap '[[ -z "$TEMP_DOCKERFILE" ]] || rm -f "$TEMP_DOCKERFILE"' EXIT
         if ! grep -qiE '^[[:space:]]*FROM[[:space:]]' "$PROJECT_DOCKERFILE"; then
             TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
             { printf 'FROM %s\n' "$BASE_IMAGE_NAME"; cat "$PROJECT_DOCKERFILE"; } \
@@ -527,8 +541,10 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
             EFFECTIVE_DOCKERFILE="$TEMP_DOCKERFILE"
         elif [[ "$BASE_IMAGE_NAME" != "$IMAGE_NAME" ]]; then
             TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
-            awk -v img="$BASE_IMAGE_NAME" \
-                'done || !/^[[:space:]]*FROM[[:space:]]/{print; next} {print "FROM " img; done=1}' \
+            awk -v img="$BASE_IMAGE_NAME" '
+                done || tolower($1) != "from" { print; next }
+                { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { $i = img; break }
+                  print; done = 1 }' \
                 "$PROJECT_DOCKERFILE" > "$TEMP_DOCKERFILE"
             EFFECTIVE_DOCKERFILE="$TEMP_DOCKERFILE"
         fi
@@ -553,11 +569,10 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
             "${CACHE_ARG[@]}" \
             "${PROJECT_BUILD_ARGS[@]}" \
             --label "claude-sandbox.dockerfile.sha256=${DOCKERFILE_SHA}" \
+            --label "codebox.base.id=${BASE_ID}" \
             -t "$PROJECT_IMAGE" \
             -f "$EFFECTIVE_DOCKERFILE" \
             "$TARGET_DIR"
-
-        [[ -n "$TEMP_DOCKERFILE" ]] && rm -f "$TEMP_DOCKERFILE"
     fi
     RUN_IMAGE="$PROJECT_IMAGE"
 fi
@@ -764,7 +779,7 @@ docker run --rm -it \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \
     "$RUN_IMAGE" \
-    "$@" || true
+    "$@" || rc=$?
 
 # As long as the container is still alive after the foreground process exited,
 # the user detached with Ctrl-Z: suspend ourselves (the shell reports a stopped
@@ -772,5 +787,10 @@ docker run --rm -it \
 while container_running; do
     kill -TSTP $$
     container_running || break
-    docker attach --detach-keys ctrl-z "$CONTAINER_NAME" || true
+    rc=0
+    docker attach --detach-keys ctrl-z "$CONTAINER_NAME" || rc=$?
 done
+
+# docker run and docker attach both exit with the agent's exit status when the
+# agent exits while attached, so pass that status on to our caller.
+exit "${rc:-0}"
