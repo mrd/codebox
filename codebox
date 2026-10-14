@@ -77,7 +77,9 @@
 #
 # Job control: Ctrl-Z suspends the session and `fg` resumes it, like any other
 #   job-control program. (Under the hood Ctrl-Z detaches from the container and
-#   `fg` re-attaches; the container keeps running while suspended.)
+#   `fg` re-attaches; the container keeps running while suspended. When the
+#   agent handles Ctrl-Z itself, as Claude Code does, it stays stopped inside
+#   the container until `fg` resumes it.)
 #
 # Environment: If the target directory contains a .env.codebox file, each
 #   KEY=VALUE line is forwarded as an environment variable to the container.
@@ -114,6 +116,23 @@
 ################################################################################
 
 set -euo pipefail
+
+# Files and the container to remove when the script exits. Set as they are
+# created further down.
+TEMP_DOCKERFILE=""
+ATTACH_PIDFILE=""
+ATTACH_ERRFILE=""
+CONTAINER_STARTED=false
+cleanup() {
+    local f
+    for f in "$TEMP_DOCKERFILE" "$ATTACH_PIDFILE" "$ATTACH_ERRFILE"; do
+        [[ -z "$f" ]] || rm -f "$f"
+    done
+    if $CONTAINER_STARTED; then
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
 
 IMAGE_NAME="codebox"
 REBUILD=false
@@ -530,10 +549,9 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
         #     so the project layers compose correctly.
         #     Only the image name is replaced, so flags such as --platform and
         #     an "AS stage" suffix are kept.
+        # The EXIT trap (cleanup) removes the temporary Dockerfile, even when
+        # the build fails.
         EFFECTIVE_DOCKERFILE="$PROJECT_DOCKERFILE"
-        TEMP_DOCKERFILE=""
-        # Remove the temporary Dockerfile even when the build fails.
-        trap '[[ -z "$TEMP_DOCKERFILE" ]] || rm -f "$TEMP_DOCKERFILE"' EXIT
         if ! grep -qiE '^[[:space:]]*FROM[[:space:]]' "$PROJECT_DOCKERFILE"; then
             TEMP_DOCKERFILE="$(mktemp --suffix=.dockerfile)"
             { printf 'FROM %s\n' "$BASE_IMAGE_NAME"; cat "$PROJECT_DOCKERFILE"; } \
@@ -697,19 +715,81 @@ CONTAINER_NAME="codebox-$(id -u)-$$"
 # Ctrl-Z / fg job control.
 #
 # Goal: Ctrl-Z suspends the session and `fg` resumes it, like a normal program.
-# This can't be done by forwarding the signal: `docker run -it` holds the host
-# terminal in raw mode (ISIG cleared), so Ctrl-Z reaches the container as raw
-# byte 0x1a and never generates SIGTSTP on the host -- the host shell never sees
-# a stopped job, so there is nothing for `fg` to resume. (And the forwarded byte
-# just stops claude *inside* the container while docker keeps the terminal.)
+# The host shell can only resume a job it has seen stop, and Ctrl-Z never stops
+# anything on the host: `docker attach` holds the host terminal in raw mode
+# (ISIG cleared), so the key is forwarded into the container instead. So this
+# script leaves the container running, stops *itself* with SIGTSTP (the shell
+# then reports a stopped job), and re-attaches when `fg` continues it. Ctrl-Z
+# reaches one of two places:
 #
-# So we build it on top of `docker attach` instead. Map Ctrl-Z to Docker's
-# --detach-keys sequence: on Ctrl-Z the docker run/attach process exits cleanly
-# (restoring the terminal) while the container keeps running. We then stop *this
-# script* with SIGTSTP, so it becomes a stopped job in the host shell; when the
-# user runs `fg` the script continues and re-attaches to the still-running
-# container. Repeat for as many Ctrl-Z / fg cycles as the user likes.
-container_running() { docker container inspect "$CONTAINER_NAME" &>/dev/null; }
+#   - Docker. --detach-keys ctrl-z makes `docker attach` exit while the
+#     container keeps running.
+#   - The agent. Claude Code switches the terminal into a keyboard mode that
+#     sends Ctrl-Z as an escape sequence, which Docker's detach-key matcher
+#     does not recognise, and since version 2.0.76 it handles Ctrl-Z by
+#     stopping itself with SIGTSTP. That needs --init: as the container's
+#     PID 1, Claude would have its stop signal ignored by the kernel and would
+#     hang waiting to be resumed. While attached, a background watcher polls
+#     `docker top` for a stopped process and ends the attach client when it
+#     finds one.
+#
+# On `fg` the script re-attaches and sends SIGCONT to the container's init
+# (docker-init), which forwards it to the agent, so a stopped agent resumes and
+# redraws. SIGCONT is harmless to an agent that was not stopped.
+#
+# The container is started detached and only ever reached through
+# `docker attach`, because ending a `docker run -it` client would close the
+# container's stdin. It is not started with --rm, so that its output and exit
+# status are still available if the agent exits before the first attach; the
+# EXIT trap removes it instead.
+container_running() {
+    [[ "$(docker container inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]
+}
+
+container_has_stopped_process() {
+    docker top "$CONTAINER_NAME" -o stat 2>/dev/null \
+        | awk 'NR > 1 && /^T/ { found = 1 } END { exit !found }'
+}
+
+# Runs in the background while attached. When a process in the container has
+# stopped itself, end the attach client so that the main loop can suspend this
+# script.
+watch_for_stop() {
+    local client
+    while sleep 0.3; do
+        client="$(cat "$ATTACH_PIDFILE" 2>/dev/null || true)"
+        [[ -n "$client" ]] || continue
+        kill -0 "$client" 2>/dev/null || return 0
+        if container_has_stopped_process; then
+            kill -TERM "$client" 2>/dev/null || true
+            return 0
+        fi
+    done
+}
+
+# Attach to the container until the agent exits, the user detaches, or the
+# agent stops itself. With "resume", also send SIGCONT once the client has had
+# time to connect, so that the agent's redraw is not lost.
+attach_once() {
+    local resume="$1" watcher
+    : > "$ATTACH_PIDFILE"
+    watch_for_stop &
+    watcher=$!
+    if $resume; then
+        { sleep 0.5; docker kill --signal CONT "$CONTAINER_NAME" >/dev/null 2>&1 || true; } &
+    fi
+    # --sig-proxy=false: the watcher's SIGTERM must end the client, not be
+    # forwarded to the agent. Docker's own errors go to a file, so that they
+    # can be told apart from the agent's output (which is all on stdout, since
+    # the container has a tty). The outer 2>/dev/null discards bash's
+    # "Terminated" report when the watcher ends the client.
+    { ( echo "$BASHPID" > "$ATTACH_PIDFILE"
+        exec docker attach --detach-keys ctrl-z --sig-proxy=false "$CONTAINER_NAME" 2>"$ATTACH_ERRFILE" ); } 2>/dev/null || true
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    # A client ended by the watcher leaves the terminal in raw mode.
+    [[ -z "$STTY_SAVED" ]] || stty "$STTY_SAVED" 2>/dev/null || true
+}
 
 # A mount spec starting with ':' is shorthand for an identity mount: the host
 # path is mounted at the same path inside the container, the way the target
@@ -765,9 +845,13 @@ if $USE_CODEX; then
     fi
 fi
 
-docker run --rm -it \
+ATTACH_PIDFILE="$(mktemp)"
+ATTACH_ERRFILE="$(mktemp)"
+STTY_SAVED="$(stty -g 2>/dev/null || true)"
+
+CONTAINER_STARTED=true
+docker run -d -it --init \
     --name "$CONTAINER_NAME" \
-    --detach-keys "ctrl-z" \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --user "$(id -u):$(id -g)" \
@@ -779,18 +863,26 @@ docker run --rm -it \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \
     "$RUN_IMAGE" \
-    "$@" || rc=$?
+    "$@" >/dev/null
 
-# As long as the container is still alive after the foreground process exited,
-# the user detached with Ctrl-Z: suspend ourselves (the shell reports a stopped
-# job) and reattach when `fg` continues us.
+attach_once false
+
+# The agent exited before the client could attach (e.g. `-- --version`), so
+# its output was never shown: show it now.
+if grep -q 'cannot attach to a stopped container' "$ATTACH_ERRFILE"; then
+    docker logs "$CONTAINER_NAME"
+elif [[ -s "$ATTACH_ERRFILE" ]]; then
+    cat "$ATTACH_ERRFILE" >&2
+fi
+
+# As long as the container is still running after the attach client exited,
+# the user pressed Ctrl-Z: suspend ourselves and reattach when `fg` continues
+# us.
 while container_running; do
     kill -TSTP $$
     container_running || break
-    rc=0
-    docker attach --detach-keys ctrl-z "$CONTAINER_NAME" || rc=$?
+    attach_once true
 done
 
-# docker run and docker attach both exit with the agent's exit status when the
-# agent exits while attached, so pass that status on to our caller.
-exit "${rc:-0}"
+# Pass the agent's exit status on to our caller.
+exit "$(docker container inspect --format '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)"
