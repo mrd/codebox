@@ -39,10 +39,12 @@
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile      Ignore the directory's Dockerfile.codebox and run the
 #                        base image instead
-#   --trust              Trust this directory's Dockerfile.codebox without
-#                        prompting (needed for non-interactive use)
-#   --allow-home         Allow DIR to be your home directory (or an ancestor of
-#                        it) without prompting; this exposes everything under it
+#   --trust              Trust this directory's Dockerfile.codebox and
+#                        .env.codebox without prompting (needed for
+#                        non-interactive use)
+#   --allow-home         Allow DIR or a --mount host path to be your home
+#                        directory (or an ancestor of it) without prompting;
+#                        this exposes everything under it
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
 #   --init               Generate a Dockerfile.codebox template in DIR
@@ -84,7 +86,9 @@
 #   target directory; forwarded keys are printed before the container starts.
 #   CODEBOX_MOUNTS is treated as a space-separated list of HOST:CONTAINER mount
 #   specifications and is forwarded as extra bind mounts. The :PATH identity
-#   shorthand accepted by --mount works here too.
+#   shorthand accepted by --mount works here too. Because a mount can expose
+#   any host path, codebox prompts before using a .env.codebox it has not
+#   seen before, the same way it does for Dockerfile.codebox (see below).
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
@@ -170,14 +174,16 @@ TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
 # for. This is easy to do by accident: a bare `codebox` in the wrong shell does
 # it. Confirm before proceeding.
 HOME_REAL="$(realpath "$HOME" 2>/dev/null || echo "$HOME")"
-_t="${TARGET_DIR%/}"
-if ! $ALLOW_HOME && [[ "$HOME_REAL" == "$_t" || "$HOME_REAL" == "$_t"/* ]]; then
-    if [[ "$HOME_REAL" == "$_t" ]]; then
-        echo "warning: $TARGET_DIR is your home directory." >&2
+guard_home() {
+    local dir="${1%/}"
+    $ALLOW_HOME && return 0
+    [[ "$HOME_REAL" == "$dir" || "$HOME_REAL" == "$dir"/* ]] || return 0
+    if [[ "$HOME_REAL" == "$dir" ]]; then
+        echo "warning: $1 is your home directory." >&2
     else
-        echo "warning: $TARGET_DIR contains your home directory ($HOME_REAL)." >&2
+        echo "warning: $1 contains your home directory ($HOME_REAL)." >&2
     fi
-    echo "  It is mounted read-write, so the agent gets your ssh keys, cloud" >&2
+    echo "  It is mounted into the container, so the agent gets your ssh keys, cloud" >&2
     echo "  credentials and everything else under it. Prefer a project directory." >&2
     if [[ ! -t 0 ]]; then
         echo "error: refusing to mount your home directory without a tty." >&2
@@ -189,7 +195,8 @@ if ! $ALLOW_HOME && [[ "$HOME_REAL" == "$_t" || "$HOME_REAL" == "$_t"/* ]]; then
         echo "Aborted." >&2
         exit 1
     fi
-fi
+}
+guard_home "$TARGET_DIR"
 
 if $USE_OPENCODE && $USE_CODEX; then
     echo "error: --opencode and --codex are mutually exclusive" >&2
@@ -274,6 +281,48 @@ ${FROM_LINE}
 DOCKERFILE
     echo "Wrote $DOCKERFILE" >&2
     exit 0
+fi
+
+# Dockerfile.codebox and .env.codebox live in the (potentially untrusted)
+# target directory, e.g. a cloned repo. A Dockerfile.codebox is arbitrary code
+# run at build time (and controls the container's ENTRYPOINT, so it can read
+# the mounted credentials); its FROM line alone pulls and runs a third-party
+# image. A .env.codebox can bind-mount any host path via CODEBOX_MOUNTS. So
+# require explicit trust before using either file. Trust is remembered per
+# (directory, file SHA) so an unchanged file is not re-prompted; editing it
+# re-prompts.
+TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+require_trust() {
+    local file="$1" desc="$2" key
+    key="$(sha256sum "$file" | cut -d' ' -f1)  ${TARGET_DIR}"
+    if ! $TRUST && ! grep -qxF "$key" "$TRUST_STORE" 2>/dev/null; then
+        echo "warning: $TARGET_DIR contains a $(basename "$file")." >&2
+        echo "$desc" >&2
+        echo "  Only trust directories you control." >&2
+        if [[ ! -t 0 ]]; then
+            echo "error: refusing to use untrusted $(basename "$file") without a tty." >&2
+            echo "       Re-run with --trust if you trust this directory." >&2
+            exit 1
+        fi
+        read -r -p "Use it? [y/N] " ans
+        if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+            echo "Aborted." >&2
+            exit 1
+        fi
+    fi
+    mkdir -p "$(dirname "$TRUST_STORE")"
+    grep -qxF "$key" "$TRUST_STORE" 2>/dev/null || echo "$key" >> "$TRUST_STORE"
+}
+
+if ! $NO_DOCKERFILE && [[ -f "$TARGET_DIR/Dockerfile.codebox" ]]; then
+    require_trust "$TARGET_DIR/Dockerfile.codebox" \
+        "  It will be built and run on your machine; it can execute arbitrary
+  code and read mounted credentials."
+fi
+if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
+    require_trust "$TARGET_DIR/.env.codebox" \
+        "  It sets environment variables for the agent and can add bind mounts
+  (CODEBOX_MOUNTS) that expose any host path to the container."
 fi
 
 # Build cache flag (empty unless cache-busting was requested). Using an array
@@ -454,31 +503,6 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
     PROJECT_IMAGE="${IMAGE_NAME}--${DIR_HASH}"
     DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
-
-    # A Dockerfile.codebox is arbitrary code run at build time (and controls the
-    # container's ENTRYPOINT, so it can read the mounted credentials). Since the
-    # target directory may be untrusted (e.g. a cloned repo), require explicit
-    # trust before building one. Trust is remembered per (directory, SHA) so an
-    # unchanged Dockerfile is not re-prompted; editing it re-prompts.
-    TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
-    TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
-    if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
-        echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
-        echo "  It will be built and run on your machine; it can execute arbitrary" >&2
-        echo "  code and read mounted credentials. Only trust directories you control." >&2
-        if [[ ! -t 0 ]]; then
-            echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
-            echo "       Re-run with --trust if you trust this directory." >&2
-            exit 1
-        fi
-        read -r -p "Build and run it? [y/N] " ans
-        if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
-            echo "Aborted." >&2
-            exit 1
-        fi
-    fi
-    mkdir -p "$(dirname "$TRUST_STORE")"
-    grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
 
     EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
         --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
@@ -694,6 +718,12 @@ for m in "${EXTRA_MOUNTS[@]}"; do
         echo "error: --mount '$m': missing ':'" >&2
         echo "       Use HOST:CONTAINER, or ':$m' to mount it at the same path." >&2
         exit 1
+    fi
+    # A host part that is a path (not a named volume) gets the same home
+    # directory check as the target directory.
+    mhost="${m%%:*}"
+    if [[ "$mhost" == /* || "$mhost" == .* ]]; then
+        guard_home "$(realpath -m "$mhost")"
     fi
     EXTRA_VOLUME_ARGS+=(-v "$m")
 done

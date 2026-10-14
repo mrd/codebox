@@ -36,7 +36,8 @@
 #                         ANTHROPIC_API_KEY for auth
 #   --no-gitconfig        Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile       Ignore Dockerfile.codebox and use base image
-#   --trust               Trust Dockerfile.codebox without prompting
+#   --trust               Trust Dockerfile.codebox and .env.codebox without
+#                         prompting
 #   --allow-home          Allow DIR to be your home directory (or an ancestor of
 #                         it) without prompting; this exposes everything under it
 #   -d, --detach          Run in background (default: foreground)
@@ -94,7 +95,8 @@
 # container, so codebox-tailclaude prompts for confirmation before building a
 # Dockerfile.codebox from a directory you have not already trusted. Trust is
 # remembered per (directory, file SHA); editing the file re-prompts. Use
-# --trust to skip the prompt (e.g. in scripts).
+# --trust to skip the prompt (e.g. in scripts). A .env.codebox gets the same
+# prompt, because its CODEBOX_MOUNTS can expose any host path.
 #
 # Environment:
 #   TS_AUTH_KEY           Tailscale auth key (get one at
@@ -337,59 +339,27 @@ build_tool_command() {
     echo "$cmd"
 }
 
-# Read .env.codebox, filter blocklist, return compose YAML env lines using
-# ${KEY:-} variable reference syntax (values NOT inlined in the YAML).
-generate_env_codebox_yaml() {
+# Tailscale sidecar settings. The host environment provides the defaults and
+# .env.codebox may override them (load_env_codebox).
+TS_AUTH_KEY_VALUE="${TS_AUTH_KEY:-}"
+TS_EXTRA_ARGS_VALUE="${TS_EXTRA_ARGS:-}"
+
+# Read .env.codebox, filter the blocklist, and collect:
+#   ENV_CODEBOX_YAML  compose YAML env lines of the form KEY: ${CODEBOX_ENV_KEY:-}
+#                     (values are NOT inlined in the YAML on disk)
+#   COMPOSE_ENV       CODEBOX_ENV_KEY=VALUE assignments, passed to docker
+#                     compose (and nothing else) via `env` by run_compose.
+# Every key is namespaced under CODEBOX_ENV_ so that .env.codebox cannot set
+# variables that change how the host-side docker compose process itself runs
+# (LD_PRELOAD, PATH, DOCKER_HOST, COMPOSE_FILE, ...).
+ENV_CODEBOX_YAML=""
+COMPOSE_ENV=()
+load_env_codebox() {
     local env_file="$TARGET_DIR/.env.codebox"
     local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR"
                      "OPENAI_API_KEY" "OPENAI_BASE_URL" "CODEX_HOME")
-    # Keys consumed by the tailscale sidecar via compose substitution. They are
-    # still exported by export_env_codebox (so ${KEY:-} resolves for the sidecar)
-    # but must NOT be forwarded into the agent container's environment.
-    local noforward=("TS_AUTH_KEY" "TS_EXTRA_ARGS")
-    local result=""
+    [[ -f "$env_file" ]] || return 0
 
-    if [[ ! -f "$env_file" ]]; then
-        echo "$result"
-        return
-    fi
-
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-        key="${key#"${key%%[![:space:]]*}"}"
-        key="${key%"${key##*[![:space:]]}"}"
-        [[ -z "$key" || "$key" =~ ^# ]] && continue
-
-        local blocked=false
-        for b in "${blocklist[@]}"; do
-            [[ "$key" == "$b" ]] && { blocked=true; break; }
-        done
-        if $blocked; then
-            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
-            continue
-        fi
-        local skip=false
-        for b in "${noforward[@]}"; do
-            [[ "$key" == "$b" ]] && { skip=true; break; }
-        done
-        if $skip; then
-            echo "using '$key' from .env.codebox for tailscale sidecar (not forwarded to agent)" >&2
-            continue
-        fi
-        echo "forwarding env from .env.codebox: $key" >&2
-        result+="      ${key}: \${${key}:-}"$'\n'
-    done < "$env_file"
-    echo "$result"
-}
-
-# Export env vars from .env.codebox so compose variable substitution picks them
-# up. Values stay in process memory, not in the compose YAML on disk.
-export_env_codebox() {
-    local env_file="$TARGET_DIR/.env.codebox"
-    local blocklist=("ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL" "ANTHROPIC_AUTH_TOKEN" "CLAUDE_CONFIG_DIR"
-                     "OPENAI_API_KEY" "OPENAI_BASE_URL" "CODEX_HOME")
-    if [[ ! -f "$env_file" ]]; then
-        return
-    fi
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
@@ -397,6 +367,12 @@ export_env_codebox() {
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
 
+        # The key is written into the compose YAML, so accept only plain
+        # variable names.
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "warning: ignoring '$key' from .env.codebox (not a valid variable name)" >&2
+            continue
+        fi
         local blocked=false
         for b in "${blocklist[@]}"; do
             [[ "$key" == "$b" ]] && { blocked=true; break; }
@@ -405,7 +381,17 @@ export_env_codebox() {
             echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
             continue
         fi
-        export "${key}=${value}"
+        # Keys consumed by the tailscale sidecar must NOT be forwarded into the
+        # agent container's environment.
+        case "$key" in
+            TS_AUTH_KEY|TS_EXTRA_ARGS)
+                echo "using '$key' from .env.codebox for tailscale sidecar (not forwarded to agent)" >&2
+                printf -v "${key}_VALUE" '%s' "$value"
+                continue ;;
+        esac
+        echo "forwarding env from .env.codebox: $key" >&2
+        ENV_CODEBOX_YAML+="      ${key}: \${CODEBOX_ENV_${key}:-}"$'\n'
+        COMPOSE_ENV+=("CODEBOX_ENV_${key}=${value}")
     done < "$env_file"
 }
 
@@ -437,6 +423,42 @@ normalize_mount() {
     echo "$m"
 }
 
+run_compose() {
+    env "${COMPOSE_ENV[@]}" \
+        "CODEBOX_TS_AUTH_KEY=${TS_AUTH_KEY_VALUE}" \
+        "CODEBOX_TS_EXTRA_ARGS=${TS_EXTRA_ARGS_VALUE}" \
+        docker compose -p "$PROJECT" "$@"
+}
+
+# Dockerfile.codebox and .env.codebox live in the (potentially untrusted)
+# target directory, e.g. a cloned repo. A Dockerfile.codebox is arbitrary code
+# run at build time (and controls the container, so it can read the mounted
+# credentials); a .env.codebox can bind-mount any host path via
+# CODEBOX_MOUNTS. So require explicit trust before using either file. Trust is
+# remembered per (directory, file SHA); editing the file re-prompts.
+TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+require_trust() {
+    local file="$1" desc="$2" key
+    key="$(sha256sum "$file" | cut -d' ' -f1)  ${TARGET_DIR}"
+    if ! $TRUST && ! grep -qxF "$key" "$TRUST_STORE" 2>/dev/null; then
+        echo "warning: $TARGET_DIR contains a $(basename "$file")." >&2
+        echo "$desc" >&2
+        echo "  Only trust directories you control." >&2
+        if [[ ! -t 0 ]]; then
+            echo "error: refusing to use untrusted $(basename "$file") without a tty." >&2
+            echo "       Re-run with --trust if you trust this directory." >&2
+            exit 1
+        fi
+        read -r -p "Use it? [y/N] " ans
+        if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
+            echo "Aborted." >&2
+            exit 1
+        fi
+    fi
+    mkdir -p "$(dirname "$TRUST_STORE")"
+    grep -qxF "$key" "$TRUST_STORE" 2>/dev/null || echo "$key" >> "$TRUST_STORE"
+}
+
 generate_compose() {
     mkdir -p "$COMPOSE_DIR"
 
@@ -448,9 +470,6 @@ generate_compose() {
     else
         tool_command="$(build_tool_command)"
     fi
-
-    local env_codebox
-    env_codebox="$(generate_env_codebox_yaml)"
 
     if $USE_OPENCODE; then
         if $NO_CREDS; then
@@ -497,9 +516,9 @@ services:
     image: tailscale/tailscale:latest
     hostname: ${TOOL}-${SUFFIX}
     environment:
-      TS_AUTH_KEY: \${TS_AUTH_KEY:-}
+      TS_AUTH_KEY: \${CODEBOX_TS_AUTH_KEY:-}
       TS_STATE_DIR: /var/lib/tailscale
-      TS_EXTRA_ARGS: \${TS_EXTRA_ARGS:-}
+      TS_EXTRA_ARGS: \${CODEBOX_TS_EXTRA_ARGS:-}
     volumes:
       - ts-data-${SUFFIX}:/var/lib/tailscale
       - ts-socket-${SUFFIX}:/tmp
@@ -532,7 +551,7 @@ $( if $USE_CODEX; then
       OPENCODE_YOLO: "true"
 $( $USE_CODEX && echo "      CODEX_HOME: /home/sandbox/.codex-home" )
 $( if ! $USE_OPENCODE && ! $USE_CODEX && [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then echo "      CLAUDE_CONFIG_DIR: \${CLAUDE_CONFIG_DIR:-}"; fi )
-${env_codebox}
+${ENV_CODEBOX_YAML}
     volumes:
       - ts-socket-${SUFFIX}:/tmp
       - "${TARGET_DIR}:${TARGET_DIR}"
@@ -675,6 +694,16 @@ DOCKERFILE
 
 up)
     ensure_compose_plugin
+    if ! $NO_DOCKERFILE && [[ -f "$TARGET_DIR/Dockerfile.codebox" ]]; then
+        require_trust "$TARGET_DIR/Dockerfile.codebox" \
+            "  It will be built and run on your machine; it can execute arbitrary
+  code and read mounted credentials."
+    fi
+    if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
+        require_trust "$TARGET_DIR/.env.codebox" \
+            "  It sets environment variables for the agent and can add bind mounts
+  (CODEBOX_MOUNTS) that expose any host path to the container."
+    fi
     ensure_base_image
 
     RUN_IMAGE="$BASE_IMAGE"
@@ -685,26 +714,6 @@ up)
         DIR_HASH="$(echo "$TARGET_DIR" | sha256sum | cut -c1-12)"
         PROJECT_IMAGE="${BASE_IMAGE}--${DIR_HASH}"
         DOCKERFILE_SHA="$(sha256sum "$PROJECT_DOCKERFILE" | cut -d' ' -f1)"
-
-        TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
-        TRUST_KEY="${DOCKERFILE_SHA}  ${TARGET_DIR}"
-        if ! $TRUST && { [[ ! -f "$TRUST_STORE" ]] || ! grep -qxF "$TRUST_KEY" "$TRUST_STORE"; }; then
-            echo "warning: $TARGET_DIR contains a Dockerfile.codebox." >&2
-            echo "  It will be built and run on your machine; it can execute arbitrary" >&2
-            echo "  code and read mounted credentials. Only trust directories you control." >&2
-            if [[ ! -t 0 ]]; then
-                echo "error: refusing to build untrusted Dockerfile.codebox without a tty." >&2
-                echo "       Re-run with --trust if you trust this directory." >&2
-                exit 1
-            fi
-            read -r -p "Build and run it? [y/N] " ans
-            if [[ "$ans" != [yY] && "$ans" != [yY][eE][sS] ]]; then
-                echo "Aborted." >&2
-                exit 1
-            fi
-        fi
-        mkdir -p "$(dirname "$TRUST_STORE")"
-        grep -qxF "$TRUST_KEY" "$TRUST_STORE" 2>/dev/null || echo "$TRUST_KEY" >> "$TRUST_STORE"
 
         EXISTING_SHA="$(docker image inspect "$PROJECT_IMAGE" \
             --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
@@ -732,15 +741,12 @@ up)
         RUN_IMAGE="$PROJECT_IMAGE"
     fi
 
+    load_env_codebox
     generate_compose
-
-    # Export .env.codebox vars so compose variable substitution picks them up
-    # (values stay in process memory, not inlined in the YAML on disk).
-    export_env_codebox
 
     cd "$COMPOSE_DIR"
     if $DETACH; then
-        docker compose -p "$PROJECT" up -d
+        run_compose up -d
         # Wait for tailscale and print IP
         for i in $(seq 1 15); do
             IP=$(docker exec "$(tailscale_container)" tailscale ip -4 2>/dev/null || true)
@@ -761,7 +767,7 @@ up)
             do_serve "$SERVE_PORT"
         fi
     else
-        docker compose -p "$PROJECT" up -d
+        run_compose up -d
         for i in $(seq 1 10); do
             TOOL_CONTAINER="$(container_name)"
             if [[ -n "$TOOL_CONTAINER" ]]; then
@@ -775,7 +781,7 @@ up)
             exit 1
         fi
 
-        if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+        if [[ -n "$TS_AUTH_KEY_VALUE" ]]; then
             for i in $(seq 1 15); do
                 IP=$(docker exec "$(tailscale_container)" tailscale ip -4 2>/dev/null || true)
                 if [[ -n "$IP" ]]; then
@@ -787,7 +793,7 @@ up)
         fi
 
         if [[ -n "$SERVE_PORT" ]]; then
-            if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+            if [[ -n "$TS_AUTH_KEY_VALUE" ]]; then
                 do_serve "$SERVE_PORT"
             else
                 echo "note: --serve requires TS_AUTH_KEY to configure Tailscale" >&2
