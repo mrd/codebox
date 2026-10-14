@@ -155,8 +155,10 @@ while [[ $# -gt 0 ]]; do
         --stop)              ACTION="stop"; shift ;;
         --logs)              ACTION="logs"; shift ;;
         --status)            ACTION="status"; shift ;;
-        --serve)             SERVE_PORT="$2"; shift 2 ;;
-        --https)             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
+        --serve)             [[ $# -gt 1 ]] || { echo "error: --serve requires a PORT argument" >&2; exit 1; }
+                             SERVE_PORT="$2"; shift 2 ;;
+        --https)             [[ $# -gt 1 ]] || { echo "error: --https requires a PORT argument" >&2; exit 1; }
+                             SERVE_HTTP=false; SERVE_HTTPS_PORT="$2"; shift 2 ;;
         --http)              SERVE_HTTP=true; shift ;;
         --init)              ACTION="init"; shift ;;
         --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
@@ -214,15 +216,19 @@ fi
 # Remaining args are passed through to the tool
 TOOL_ARGS=("$@")
 
+# These images add the tailscale CLI, so they get names of their own rather
+# than sharing codebox's "codebox" / "codebox-opencode" / "codebox-codex":
+# with a shared name, whichever script built the image first would win and the
+# other would reuse it.
 if $USE_OPENCODE; then
     TOOL="opencode"
-    BASE_IMAGE="codebox-opencode"
+    BASE_IMAGE="codebox-tailclaude-opencode"
 elif $USE_CODEX; then
     TOOL="codex"
-    BASE_IMAGE="codebox-codex"
+    BASE_IMAGE="codebox-tailclaude-codex"
 else
     TOOL="claude"
-    BASE_IMAGE="codebox"
+    BASE_IMAGE="codebox-tailclaude"
 fi
 
 # Codex sandboxes model-generated commands itself (bubblewrap/Landlock, which
@@ -246,6 +252,11 @@ if $USE_CODEX; then
     fi
 fi
 
+case "$(uname -m)" in
+    aarch64|arm64) TS_ARCH="arm64" ;;
+    *)             TS_ARCH="amd64" ;;
+esac
+
 SUFFIX="$(echo "$TARGET_DIR" | sha256sum | cut -c1-8)"
 PROJECT="codebox-tailclaude-${SUFFIX}"
 COMPOSE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/compose-tailclaude"
@@ -261,7 +272,8 @@ ensure_base_image() {
     fi
     echo "Building $BASE_IMAGE..." >&2
     if $USE_OPENCODE; then
-        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
+        docker build "${CACHE_ARG[@]}" --network=host \
+            --build-arg "TS_ARCH=$TS_ARCH" -t "$BASE_IMAGE" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates \
@@ -271,12 +283,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://opencode.ai/install | bash
-RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+ARG TS_ARCH
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_${TS_ARCH}.tgz" \
     | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
 ENTRYPOINT ["opencode"]
 DOCKERFILE
     elif $USE_CODEX; then
-        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
+        docker build "${CACHE_ARG[@]}" --network=host \
+            --build-arg "TS_ARCH=$TS_ARCH" -t "$BASE_IMAGE" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates \
@@ -286,12 +300,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
-RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+ARG TS_ARCH
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_${TS_ARCH}.tgz" \
     | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
 ENTRYPOINT ["codex"]
 DOCKERFILE
     else
-        docker build "${CACHE_ARG[@]}" --network=host -t "$BASE_IMAGE" - <<'DOCKERFILE'
+        docker build "${CACHE_ARG[@]}" --network=host \
+            --build-arg "TS_ARCH=$TS_ARCH" -t "$BASE_IMAGE" - <<'DOCKERFILE'
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates \
@@ -301,7 +317,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://claude.ai/install.sh | bash
-RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" \
+ARG TS_ARCH
+RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_latest_${TS_ARCH}.tgz" \
     | tar xz -C /usr/local/bin --strip-components=1 --wildcards '*/tailscale'
 ENTRYPOINT ["claude"]
 DOCKERFILE
@@ -462,11 +479,16 @@ require_trust() {
 generate_compose() {
     mkdir -p "$COMPOSE_DIR"
 
-    local tool_command
+    local tool_command entrypoint_lines=""
     if $DETACH; then
         # In detach mode, keep the container alive with sleep so the user can
-        # later attach with `docker exec -it`.
-        tool_command="[\"sleep\",\"infinity\"]"
+        # later attach with `docker exec -it`. The image's ENTRYPOINT is the
+        # tool itself, so sleep must replace the entrypoint: as the command it
+        # would run `claude sleep infinity`, i.e. a session whose first prompt
+        # is "sleep infinity". init: true lets `down` stop the sleep promptly.
+        tool_command="[]"
+        entrypoint_lines='    entrypoint: ["sleep", "infinity"]
+    init: true'
     else
         tool_command="$(build_tool_command)"
     fi
@@ -532,6 +554,10 @@ services:
     image: ${RUN_IMAGE}
     network_mode: "service:tailscale"
     user: "$(id -u):$(id -g)"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     stdin_open: true
     tty: true
     environment:
@@ -593,6 +619,7 @@ EOF
 
     cat >> "$COMPOSE_DIR/docker-compose.yml" <<EOF
     working_dir: "${TARGET_DIR}"
+${entrypoint_lines}
     command: ${tool_command}
     depends_on:
       - tailscale
@@ -645,7 +672,8 @@ init)
 # pre-install system packages, language runtimes, and project deps.
 #
 # No FROM line needed — the script auto-injects the correct base image
-# (codebox for Claude, codebox-opencode for OpenCode, codebox-codex for Codex).
+# (codebox-tailclaude for Claude, codebox-tailclaude-opencode for OpenCode,
+# codebox-tailclaude-codex for Codex).
 #
 # Container context:
 #   HOME = /home/sandbox
@@ -719,14 +747,21 @@ up)
             --format '{{index .Config.Labels "claude-sandbox.dockerfile.sha256"}}' 2>/dev/null || true)"
         if $REBUILD || [[ "$EXISTING_SHA" != "$DOCKERFILE_SHA" ]]; then
             echo "Building project image for $TARGET_DIR..." >&2
-            # Auto-inject the FROM line based on --claude/--opencode/--codex.
-            # Strip any existing FROM from the user's Dockerfile.codebox.
+            # Auto-inject the correct FROM line based on --claude/--opencode/--codex.
+            # With no FROM line, prepend one. Otherwise replace the image name
+            # in the first FROM line, wherever it is (a file written by
+            # `codebox --init` has comments above it), keeping any flags and
+            # "AS stage" suffix.
             {
-                echo "FROM ${BASE_IMAGE}"
-                if head -1 "$PROJECT_DOCKERFILE" | grep -qi '^FROM '; then
-                    tail -n +2 "$PROJECT_DOCKERFILE"
-                else
+                if ! grep -qiE '^[[:space:]]*FROM[[:space:]]' "$PROJECT_DOCKERFILE"; then
+                    echo "FROM ${BASE_IMAGE}"
                     cat "$PROJECT_DOCKERFILE"
+                else
+                    awk -v img="$BASE_IMAGE" '
+                        done || tolower($1) != "from" { print; next }
+                        { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { $i = img; break }
+                          print; done = 1 }' \
+                        "$PROJECT_DOCKERFILE"
                 fi
             } | docker build \
                 "${CACHE_ARG[@]}" \
