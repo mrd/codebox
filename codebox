@@ -47,6 +47,12 @@
 #                        this exposes everything under it
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
+#   --tailscale          Put the container on your tailnet through a Tailscale
+#                        sidecar container (see Tailscale below)
+#   --serve PORT         With --tailscale, make PORT in the container reachable
+#                        from the tailnet over HTTP on port 80 (Tailscale Serve)
+#   --serve-https        With --serve, use HTTPS on port 443 instead of HTTP
+#                        (needs HTTPS certificates enabled for the tailnet)
 #   --init               Generate a Dockerfile.codebox template in DIR
 #   -h, --help           Show this help
 #
@@ -100,6 +106,23 @@
 #   a path codebox mounts itself (DIR, the agent config, ~/.gitconfig) is
 #   ignored with a warning.
 #
+# Tailscale: --tailscale starts a tailscale/tailscale sidecar container and
+#   runs the agent's container in the sidecar's network namespace. Tailnet
+#   devices can then reach ports the agent listens on, and the agent can reach
+#   tailnet devices through the tailscale CLI, which is added to the image
+#   (e.g. `tailscale nc PEER PORT`; the sidecar uses userspace networking, so
+#   tailnet addresses are not routed directly). The node is named TOOL-HASH,
+#   e.g. claude-1a2b3c4d, where HASH identifies DIR. Its state is kept in the
+#   docker volume codebox-tailscale-state-HASH, so the node keeps its identity
+#   across runs; the sidecar is removed when the agent exits.
+#   TS_AUTH_KEY (an auth key from https://login.tailscale.com/admin/settings/keys)
+#   and TS_EXTRA_ARGS (extra arguments for `tailscale up`) are read from the
+#   host environment, then the user-wide env file, then .env.codebox. They go
+#   to the sidecar only, never to the agent. .env.codebox may not set
+#   TS_EXTRA_ARGS, because --login-server would send the auth key elsewhere. Without TS_AUTH_KEY, codebox
+#   prints a login URL and waits for you to log in. --serve settings last for
+#   one run: each run with --tailscale clears the previous run's.
+#
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
 #   FROM codebox          (Claude Code, the default)
@@ -131,6 +154,7 @@ TEMP_DOCKERFILE=""
 ATTACH_PIDFILE=""
 ATTACH_ERRFILE=""
 CONTAINER_STARTED=false
+TS_STARTED=false
 cleanup() {
     local f
     for f in "$TEMP_DOCKERFILE" "$ATTACH_PIDFILE" "$ATTACH_ERRFILE"; do
@@ -138,6 +162,12 @@ cleanup() {
     done
     if $CONTAINER_STARTED; then
         docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+    # The agent's container uses the sidecar's network and socket volume, so
+    # it is removed first.
+    if $TS_STARTED; then
+        docker rm -f "$TS_CONTAINER" >/dev/null 2>&1 || true
+        docker volume rm "$TS_SOCKET_VOLUME" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
@@ -152,6 +182,9 @@ USE_OPENCODE=false
 USE_CODEX=false
 TRUST=false
 ALLOW_HOME=false
+USE_TAILSCALE=false
+SERVE_PORT=""
+SERVE_HTTPS=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
 ACTION="up"
@@ -184,6 +217,10 @@ while [[ $# -gt 0 ]]; do
                              CLI_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         --codex)             USE_CODEX=true; shift ;;
+        --tailscale)         USE_TAILSCALE=true; shift ;;
+        --serve)             [[ $# -gt 1 ]] || { echo "error: --serve requires a PORT argument" >&2; exit 1; }
+                             SERVE_PORT="$2"; shift 2 ;;
+        --serve-https)       SERVE_HTTPS=true; shift ;;
         --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
@@ -235,10 +272,26 @@ if $USE_OPENCODE && $USE_CODEX; then
     exit 1
 fi
 
+if [[ -n "$SERVE_PORT" ]] && ! $USE_TAILSCALE; then
+    echo "error: --serve requires --tailscale" >&2
+    exit 1
+fi
+if [[ -n "$SERVE_PORT" && ! "$SERVE_PORT" =~ ^[0-9]+$ ]]; then
+    echo "error: --serve: not a port number: $SERVE_PORT" >&2
+    exit 1
+fi
+if $SERVE_HTTPS && [[ -z "$SERVE_PORT" ]]; then
+    echo "error: --serve-https requires --serve PORT" >&2
+    exit 1
+fi
+
+TOOL="claude"
 if $USE_OPENCODE; then
     IMAGE_NAME="codebox-opencode"
+    TOOL="opencode"
 elif $USE_CODEX; then
     IMAGE_NAME="codebox-codex"
+    TOOL="codex"
 fi
 
 # If a non-default base image is requested, derive a unique image name so the
@@ -288,6 +341,10 @@ if [[ "$ACTION" == "init" ]]; then
 #   Working directory = your project directory (mounted read-write)
 #   Credentials ~/.claude or ~/.config/opencode = mounted from host
 #   Git config = mounted from host (~/.gitconfig, read-only)
+#   With --tailscale: the tailscale CLI is added on top of this image, and
+#   \`tailscale nc PEER PORT\` connects to a tailnet device. For example, this
+#   forwards localhost:15556 to PEER:PORT (needs socat):
+#     socat TCP-LISTEN:15556,fork,reuseaddr SYSTEM:"tailscale nc PEER PORT" &
 #
 # Declare ARG USER_ID or ARG GROUP_ID below and codebox passes the host uid/gid
 # as build args, so files installed during the build can be chowned to the user
@@ -358,6 +415,23 @@ if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
     require_trust "$TARGET_DIR/.env.codebox" \
         "  It sets environment variables for the agent and can add bind mounts
   (CODEBOX_MOUNTS) that expose any host path to the container."
+fi
+
+# Tailscale sidecar names. They depend only on DIR (and the node name also on
+# the agent), so a node keeps its name and state across runs. Two sessions in
+# one directory would share the state volume, so the second one is refused.
+TS_IMAGE="tailscale/tailscale:latest"
+if $USE_TAILSCALE; then
+    TS_SUFFIX="$(echo "$TARGET_DIR" | sha256sum | cut -c1-8)"
+    TS_CONTAINER="codebox-tailscale-${TS_SUFFIX}"
+    TS_STATE_VOLUME="codebox-tailscale-state-${TS_SUFFIX}"
+    TS_SOCKET_VOLUME="codebox-tailscale-sock-${TS_SUFFIX}"
+    TS_HOSTNAME="${TOOL}-${TS_SUFFIX}"
+    if docker container inspect "$TS_CONTAINER" &>/dev/null; then
+        echo "error: a tailscale sidecar for $TARGET_DIR already exists ($TS_CONTAINER)." >&2
+        echo "       If no codebox session is using it, remove it with: docker rm -f $TS_CONTAINER" >&2
+        exit 1
+    fi
 fi
 
 # Build cache flag (empty unless cache-busting was requested). Using an array
@@ -611,6 +685,42 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     RUN_IMAGE="$PROJECT_IMAGE"
 fi
 
+# With --tailscale, add the tailscale CLI to the image the agent runs, so that
+# the agent can reach tailnet peers (`tailscale nc`). The binary is static, so
+# copying it from the sidecar's image works on any base image. The CLI looks
+# for the daemon's socket at /var/run/tailscale/tailscaled.sock, where the
+# sidecar's socket volume is mounted; /tmp/tailscaled.sock is linked there too
+# for commands written for codebox-tailclaude, which shared the socket there.
+# The layer is rebuilt when the image under it changes.
+if $USE_TAILSCALE; then
+    TS_RUN_IMAGE="${RUN_IMAGE}--tailscale"
+    RUN_ID="$(docker image inspect --format '{{.Id}}' "$RUN_IMAGE")"
+    EXISTING_RUN_ID="$(docker image inspect "$TS_RUN_IMAGE" \
+        --format '{{index .Config.Labels "codebox.base.id"}}' 2>/dev/null || true)"
+    if $REBUILD || [[ "$EXISTING_RUN_ID" != "$RUN_ID" ]]; then
+        # COPY --from uses the local tailscale image, so fetch a newer one
+        # when a rebuild is requested.
+        if $REBUILD; then
+            docker pull "$TS_IMAGE"
+        fi
+        echo "Building $TS_RUN_IMAGE..." >&2
+        docker build "${CACHE_ARG[@]}" \
+            --build-arg "RUN_IMAGE=$RUN_IMAGE" \
+            --build-arg "TS_IMAGE=$TS_IMAGE" \
+            --label "codebox.base.id=${RUN_ID}" \
+            -t "$TS_RUN_IMAGE" - <<'DOCKERFILE'
+ARG RUN_IMAGE
+ARG TS_IMAGE
+FROM ${TS_IMAGE} AS tailscale
+FROM ${RUN_IMAGE}
+USER root
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
+RUN ln -sf /var/run/tailscale/tailscaled.sock /tmp/tailscaled.sock
+DOCKERFILE
+    fi
+    RUN_IMAGE="$TS_RUN_IMAGE"
+fi
+
 # Collect env vars to forward
 ENV_ARGS=()
 if $USE_CODEX; then
@@ -638,7 +748,14 @@ done
 # for blocked keys, which only the user file can set. CODEBOX_MOUNTS from both
 # files are combined. Forwarded keys are printed so they are visible before the
 # container starts.
-ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME)
+#
+# The Tailscale keys configure the sidecar (--tailscale). They are taken out of
+# the files here and never forwarded to the agent, because an auth key would
+# let the agent add devices to your tailnet. The host environment provides the
+# defaults.
+TS_AUTH_KEY_VALUE="${TS_AUTH_KEY:-}"
+TS_EXTRA_ARGS_VALUE="${TS_EXTRA_ARGS:-}"
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME TS_EXTRA_ARGS)
 load_env_file() {
     local env_file="$1" use_blocklist="$2" label="$3"
     local key value blocked b m mounts
@@ -658,6 +775,14 @@ load_env_file() {
                 continue
             fi
         fi
+        case "$key" in
+            TS_AUTH_KEY|TS_EXTRA_ARGS)
+                if $USE_TAILSCALE; then
+                    echo "using '$key' from $label for the tailscale sidecar (not forwarded to the agent)" >&2
+                    printf -v "${key}_VALUE" '%s' "$value"
+                fi
+                continue ;;
+        esac
         echo "forwarding env from $label: $key" >&2
         ENV_ARGS+=(-e "${key}=${value}")
     done < "$env_file"
@@ -854,6 +979,9 @@ for a in "${GITCONFIG_MOUNTS[@]}"; do
     [[ "$a" == -v ]] && continue
     BUILTIN_DESTS+=("$(mount_dest "$a")"); BUILTIN_DESCS+=("~/.gitconfig")
 done
+if $USE_TAILSCALE; then
+    BUILTIN_DESTS+=(/var/run/tailscale); BUILTIN_DESCS+=("the tailscale socket")
+fi
 MOUNT_SPECS=(); MOUNT_DESTS=(); MOUNT_SRCS=()
 for i in "${!EXTRA_MOUNTS[@]}"; do
     m="${EXTRA_MOUNTS[$i]}"
@@ -935,6 +1063,69 @@ ATTACH_PIDFILE="$(mktemp)"
 ATTACH_ERRFILE="$(mktemp)"
 STTY_SAVED="$(stty -g 2>/dev/null || true)"
 
+# Start the Tailscale sidecar. The agent's container joins its network
+# namespace, so the agent's ports are the node's ports. The sidecar runs in
+# userspace networking mode (the image's default), which needs no tun device
+# and no added capabilities. The auth key reaches docker through the
+# environment rather than the command line, where other host users could read
+# it.
+NETWORK_ARGS=()
+if $USE_TAILSCALE; then
+    TS_STARTED=true
+    docker volume create "$TS_SOCKET_VOLUME" >/dev/null
+    TS_AUTHKEY="$TS_AUTH_KEY_VALUE" TS_EXTRA_ARGS="$TS_EXTRA_ARGS_VALUE" \
+    docker run -d \
+        --name "$TS_CONTAINER" \
+        --hostname "$TS_HOSTNAME" \
+        --security-opt no-new-privileges \
+        -e TS_AUTHKEY \
+        -e TS_EXTRA_ARGS \
+        -e TS_STATE_DIR=/var/lib/tailscale \
+        -e TS_SOCKET=/var/run/tailscale/tailscaled.sock \
+        -e TS_USERSPACE=true \
+        -v "$TS_STATE_VOLUME:/var/lib/tailscale" \
+        -v "$TS_SOCKET_VOLUME:/var/run/tailscale" \
+        "$TS_IMAGE" >/dev/null
+
+    # Wait for the node to join the tailnet. Without an auth key, show the
+    # login URL from the sidecar's log and give the user time to use it.
+    if [[ -n "$TS_AUTH_KEY_VALUE" ]]; then ts_wait=30; else ts_wait=300; fi
+    ts_ip=""
+    ts_url=""
+    for ((i = 0; i < ts_wait; i++)); do
+        if [[ "$(docker container inspect --format '{{.State.Running}}' "$TS_CONTAINER" 2>/dev/null)" != true ]]; then
+            echo "error: the tailscale sidecar exited. Its log:" >&2
+            docker logs "$TS_CONTAINER" >&2 || true
+            exit 1
+        fi
+        ts_ip="$(docker exec "$TS_CONTAINER" tailscale ip -4 2>/dev/null || true)"
+        [[ -z "$ts_ip" ]] || break
+        if [[ -z "$TS_AUTH_KEY_VALUE" && -z "$ts_url" ]]; then
+            ts_url="$(docker logs "$TS_CONTAINER" 2>&1 \
+                | grep -o 'https://login\.tailscale\.com/[^[:space:]]*' | head -1 || true)"
+            [[ -z "$ts_url" ]] || echo "To add $TS_HOSTNAME to your tailnet, log in at: $ts_url" >&2
+        fi
+        sleep 1
+    done
+    if [[ -n "$ts_ip" ]]; then
+        echo "Tailnet: $TS_HOSTNAME ($ts_ip)" >&2
+        # Serve settings are kept in the node's state, so clear the ones a
+        # previous run made before applying this run's.
+        docker exec "$TS_CONTAINER" tailscale serve reset >/dev/null 2>&1 || true
+        if [[ -n "$SERVE_PORT" ]]; then
+            if $SERVE_HTTPS; then serve_listen=(--https=443); else serve_listen=(--http=80); fi
+            docker exec "$TS_CONTAINER" tailscale serve --bg "${serve_listen[@]}" \
+                "http://localhost:${SERVE_PORT}" >&2 \
+                || echo "warning: tailscale serve failed; port $SERVE_PORT is not served" >&2
+        fi
+    else
+        echo "warning: $TS_HOSTNAME has not joined the tailnet after ${ts_wait}s; starting the agent anyway." >&2
+        echo "         See: docker logs $TS_CONTAINER" >&2
+        [[ -z "$SERVE_PORT" ]] || echo "warning: port $SERVE_PORT is not served" >&2
+    fi
+    NETWORK_ARGS=(--network "container:$TS_CONTAINER" -v "$TS_SOCKET_VOLUME:/var/run/tailscale")
+fi
+
 CONTAINER_STARTED=true
 docker run -d -it --init \
     --name "$CONTAINER_NAME" \
@@ -945,6 +1136,7 @@ docker run -d -it --init \
     "${CRED_MOUNTS[@]}" \
     "${GITCONFIG_MOUNTS[@]}" \
     "${EXTRA_VOLUME_ARGS[@]}" \
+    "${NETWORK_ARGS[@]}" \
     -w "$TARGET_DIR" \
     -e HOME=/home/sandbox \
     "${ENV_ARGS[@]}" \

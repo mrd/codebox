@@ -40,6 +40,9 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `--allow-home` | Skip the confirmation prompt when `DIR` or a `--mount` host path is your home directory or an ancestor of it |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
 | `--codex` | Use [OpenAI Codex](https://chatgpt.com/codex) instead of Claude Code |
+| `--tailscale` | Put the container on your tailnet through a Tailscale sidecar container (see [Tailscale](#tailscale)) |
+| `--serve PORT` | With `--tailscale`, make `PORT` in the container reachable from the tailnet over HTTP on port 80 |
+| `--serve-https` | With `--serve`, use HTTPS on port 443 instead. The tailnet must have HTTPS certificates enabled |
 | `--init` | Write a `Dockerfile.codebox` template into `DIR` |
 | `-h`, `--help` | Show help |
 
@@ -156,7 +159,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 
 If the project directory contains a `.env.codebox`, each `KEY=VALUE` line is passed to the container as an environment variable. Lines starting with `#` are ignored. Values are used as written, so quotes are kept as part of the value (`CODEBOX_MOUNTS` is the exception). codebox prints the name of each variable it passes on.
 
-These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`.
+These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`, and `TS_EXTRA_ARGS` (see [Tailscale](#tailscale)).
 
 `CODEBOX_MOUNTS` is a space-separated list of extra bind mounts in the same format as `--mount`:
 
@@ -166,7 +169,7 @@ CODEBOX_MOUNTS=":/srv/data:ro ../shared:/shared"
 
 ## User-wide environment: `~/.config/codebox/env`
 
-`codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts` or `codebox-tailclaude`.
+`codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts`, `codebox-tailclaude` or `codebox-web`.
 
 ## Duplicate mounts
 
@@ -183,10 +186,25 @@ So before using either file for the first time, codebox shows a warning and asks
 
 Without a terminal, codebox refuses an untrusted file. Pass `--trust` to accept the project's files without asking.
 
+## Tailscale
+
+With `--tailscale`, codebox starts a `tailscale/tailscale` container named `codebox-tailscale-<hash>` next to the agent's container, and runs the agent's container in the sidecar's network namespace. The hash identifies the project directory. The tailnet node is named after the tool and the hash, for example `claude-1a2b3c4d`.
+
+- Tailnet devices can reach ports that the agent's processes listen on. `--serve PORT` also publishes `PORT` through Tailscale Serve, over HTTP on port 80, or over HTTPS on port 443 with `--serve-https`. Each run clears the Serve settings of the previous run.
+- The sidecar uses userspace networking, so it needs no tun device and no added capabilities, and tailnet addresses are not routed from inside the container. codebox adds the `tailscale` CLI to the agent's image (as an image named `<image>--tailscale`), so the agent can reach a tailnet device with `tailscale nc PEER PORT`.
+- The node's state is kept in the docker volume `codebox-tailscale-state-<hash>`, so the node keeps its identity across runs. Remove the volume to remove the node's key from your machine.
+- codebox removes the sidecar when the agent exits. Only one `--tailscale` session can run per project directory.
+
+`TS_AUTH_KEY` (an [auth key](https://login.tailscale.com/admin/settings/keys)) and `TS_EXTRA_ARGS` (extra arguments for `tailscale up`) are read from your environment, then from the user-wide env file, then from `.env.codebox`, with later values overriding earlier ones. Both are passed to the sidecar only, never to the agent. `.env.codebox` may not set `TS_EXTRA_ARGS`, because a `--login-server` argument in it would send your auth key to another server. Without `TS_AUTH_KEY`, codebox prints a login URL and waits up to five minutes for you to log in.
+
+```sh
+TS_AUTH_KEY=tskey-auth-... codebox --tailscale --serve 3000 ~/src/myproject
+```
+
 ## Security
 
 Network access from the container is not restricted, so an agent can send your code or anything else it can read to any server. The tools are installed by piping their install scripts into a shell, so the image build trusts claude.ai, opencode.ai and chatgpt.com to serve the right scripts.
 
 ## Other scripts
 
-This repository also contains `codebox-ts`, `codebox-tailclaude` and `codebox-web`, which add Tailscale access to the container. They are experimental, are not covered by this README, and lack some of the fixes in `codebox`.
+This repository also contains `codebox-ts`, `codebox-tailclaude` and `codebox-web`, which add Tailscale access to the container. They are experimental, are not covered by this README, and lack some of the fixes in `codebox`. `codebox --tailscale` replaces `codebox-tailclaude`.
