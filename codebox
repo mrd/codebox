@@ -754,6 +754,7 @@ done
 # let the agent add devices to your tailnet. The host environment provides the
 # defaults.
 TS_AUTH_KEY_VALUE="${TS_AUTH_KEY:-}"
+TS_AUTH_KEY_SRC="your environment"
 TS_EXTRA_ARGS_VALUE="${TS_EXTRA_ARGS:-}"
 ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME TS_EXTRA_ARGS)
 load_env_file() {
@@ -780,6 +781,7 @@ load_env_file() {
                 if $USE_TAILSCALE; then
                     echo "using '$key' from $label for the tailscale sidecar (not forwarded to the agent)" >&2
                     printf -v "${key}_VALUE" '%s' "$value"
+                    [[ "$key" != TS_AUTH_KEY ]] || TS_AUTH_KEY_SRC="$label"
                 fi
                 continue ;;
         esac
@@ -1087,6 +1089,34 @@ if $USE_TAILSCALE; then
         -v "$TS_SOCKET_VOLUME:/var/run/tailscale" \
         "$TS_IMAGE" >/dev/null
 
+    # The sidecar exits when it cannot log in, most often because the
+    # control server rejected the auth key. Its log is long, so save it and
+    # report only the error it ends with. The log is saved because the EXIT
+    # trap removes the sidecar.
+    ts_sidecar_failed() {
+        local log_file reason
+        log_file="${XDG_STATE_HOME:-$HOME/.local/state}/codebox/tailscale-${TS_SUFFIX}.log"
+        mkdir -p "$(dirname "$log_file")"
+        docker logs "$TS_CONTAINER" > "$log_file" 2>&1 || true
+        reason="$(sed -n 's/^backend error: //p' "$log_file" | tail -1)"
+        [[ -n "$reason" ]] \
+            || reason="$(sed -n 's/^boot: [0-9/]* [0-9:]* //p' "$log_file" | tail -1)"
+        echo "error: the tailscale sidecar could not join the tailnet${reason:+: $reason}" >&2
+        if [[ "$reason" == *"invalid key"* || "$reason" == *expired* ]]; then
+            echo "       The control server rejected TS_AUTH_KEY from $TS_AUTH_KEY_SRC." >&2
+            if [[ "$TS_AUTH_KEY_VALUE" == [\"\']* ]]; then
+                echo "       Its value starts with a quote, which codebox passes on as part of the" >&2
+                echo "       key. Remove the quotes." >&2
+            else
+                echo "       The key may be revoked or expired, a one-off key that was already" >&2
+                echo "       used, or not an auth key (those start with tskey-auth-). Make a new" >&2
+                echo "       one at https://login.tailscale.com/admin/settings/keys" >&2
+            fi
+        fi
+        echo "       The sidecar's full log is in $log_file" >&2
+        exit 1
+    }
+
     # Wait for the node to join the tailnet. Without an auth key, show the
     # login URL from the sidecar's log and give the user time to use it.
     if [[ -n "$TS_AUTH_KEY_VALUE" ]]; then ts_wait=30; else ts_wait=300; fi
@@ -1094,9 +1124,7 @@ if $USE_TAILSCALE; then
     ts_url=""
     for ((i = 0; i < ts_wait; i++)); do
         if [[ "$(docker container inspect --format '{{.State.Running}}' "$TS_CONTAINER" 2>/dev/null)" != true ]]; then
-            echo "error: the tailscale sidecar exited. Its log:" >&2
-            docker logs "$TS_CONTAINER" >&2 || true
-            exit 1
+            ts_sidecar_failed
         fi
         ts_ip="$(docker exec "$TS_CONTAINER" tailscale ip -4 2>/dev/null || true)"
         [[ -z "$ts_ip" ]] || break

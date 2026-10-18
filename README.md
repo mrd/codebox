@@ -194,6 +194,7 @@ With `--tailscale`, codebox starts a `tailscale/tailscale` container named `code
 - The sidecar uses userspace networking, so it needs no tun device and no added capabilities, and tailnet addresses are not routed from inside the container. codebox adds the `tailscale` CLI to the agent's image (as an image named `<image>--tailscale`), so the agent can reach a tailnet device with `tailscale nc PEER PORT`.
 - The node's state is kept in the docker volume `codebox-tailscale-state-<hash>`, so the node keeps its identity across runs. Remove the volume to remove the node's key from your machine.
 - codebox removes the sidecar when the agent exits. Only one `--tailscale` session can run per project directory.
+- If the sidecar cannot join the tailnet, for example because the auth key was rejected, codebox stops before starting the agent, prints the error from the sidecar's log, and saves the full log in `~/.local/state/codebox/tailscale-<hash>.log` (or under `$XDG_STATE_HOME`).
 
 `TS_AUTH_KEY` (an [auth key](https://login.tailscale.com/admin/settings/keys)) and `TS_EXTRA_ARGS` (extra arguments for `tailscale up`) are read from your environment, then from the user-wide env file, then from `.env.codebox`, with later values overriding earlier ones. Both are passed to the sidecar only, never to the agent. `.env.codebox` may not set `TS_EXTRA_ARGS`, because a `--login-server` argument in it would send your auth key to another server. Without `TS_AUTH_KEY`, codebox prints a login URL and waits up to five minutes for you to log in.
 
