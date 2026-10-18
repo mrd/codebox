@@ -95,6 +95,10 @@
 #   is read the same way before .env.codebox, without a prompt and without
 #   the sensitive-key refusal. Values from .env.codebox override it, except
 #   for the refused keys; CODEBOX_MOUNTS from both files are combined.
+#   When two extra mounts share a container path, the later one is used (user
+#   file, then .env.codebox, then --mount), with a warning. An extra mount at
+#   a path codebox mounts itself (DIR, the agent config, ~/.gitconfig) is
+#   ignored with a warning.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
@@ -151,7 +155,12 @@ ALLOW_HOME=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
 ACTION="up"
+# Extra mount specs, and where each came from (for duplicate warnings).
+# --mount specs are collected separately and appended after the env files'
+# CODEBOX_MOUNTS, so that the command line takes precedence.
 EXTRA_MOUNTS=()
+EXTRA_MOUNT_SRCS=()
+CLI_MOUNTS=()
 
 usage() {
     sed -n '/^# Run /,/^####/{ /^####/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -172,7 +181,7 @@ while [[ $# -gt 0 ]]; do
         --trust)             TRUST=true; shift ;;
         --allow-home)        ALLOW_HOME=true; shift ;;
         --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
-                             EXTRA_MOUNTS+=("$2"); shift 2 ;;
+                             CLI_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         --codex)             USE_CODEX=true; shift ;;
         --init)              ACTION="init"; shift ;;
@@ -665,7 +674,9 @@ load_env_file() {
         if [[ -n "$value" ]]; then
             while IFS=' ' read -ra mounts; do
                 for m in "${mounts[@]}"; do
-                    [[ -n "$m" ]] && EXTRA_MOUNTS+=("$m")
+                    [[ -n "$m" ]] || continue
+                    EXTRA_MOUNTS+=("$m")
+                    EXTRA_MOUNT_SRCS+=("$label")
                 done
             done <<< "$value"
         fi
@@ -678,6 +689,10 @@ fi
 if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
     load_env_file "$TARGET_DIR/.env.codebox" true ".env.codebox"
 fi
+for m in "${CLI_MOUNTS[@]}"; do
+    EXTRA_MOUNTS+=("$m")
+    EXTRA_MOUNT_SRCS+=("--mount")
+done
 
 # Credential/config mounts.
 #
@@ -816,24 +831,75 @@ attach_once() {
 # directory itself is. ":PATH" becomes "PATH:PATH" and any trailing docker
 # options are kept, so ":/data:ro" becomes "/data:/data:ro". The path is
 # resolved (like TARGET_DIR) so relative shorthands such as ":../sibling" work.
-EXTRA_VOLUME_ARGS=()
-for m in "${EXTRA_MOUNTS[@]}"; do
+#
+# Docker refuses to start a container when two mounts share a container path,
+# so duplicates are resolved here. An extra mount at the same container path
+# as one of codebox's own mounts (the target directory, the agent's config,
+# .gitconfig) is ignored, since the agent depends on those. Between extra
+# mounts the later one wins (user env file, then .env.codebox, then --mount),
+# with a warning unless the two specs are identical.
+mount_dest() {
+    local dest="${1#*:}"
+    dest="${dest%%:*}"
+    while [[ "$dest" == */ && "$dest" != / ]]; do dest="${dest%/}"; done
+    printf '%s' "$dest"
+}
+BUILTIN_DESTS=("$TARGET_DIR")
+BUILTIN_DESCS=("the project directory")
+for a in "${CRED_MOUNTS[@]}"; do
+    [[ "$a" == -v ]] && continue
+    BUILTIN_DESTS+=("$(mount_dest "$a")"); BUILTIN_DESCS+=("the agent's config")
+done
+for a in "${GITCONFIG_MOUNTS[@]}"; do
+    [[ "$a" == -v ]] && continue
+    BUILTIN_DESTS+=("$(mount_dest "$a")"); BUILTIN_DESCS+=("~/.gitconfig")
+done
+MOUNT_SPECS=(); MOUNT_DESTS=(); MOUNT_SRCS=()
+for i in "${!EXTRA_MOUNTS[@]}"; do
+    m="${EXTRA_MOUNTS[$i]}"
+    src="${EXTRA_MOUNT_SRCS[$i]}"
     if [[ "$m" == :* ]]; then
         spec="${m#:}"
         mpath="${spec%%:*}"
         mopts="${spec#"$mpath"}"
-        [[ -n "$mpath" ]] || { echo "error: --mount '$m': ':' shorthand requires a path (:PATH[:OPTIONS])" >&2; exit 1; }
-        mpath="$(realpath "$mpath" 2>/dev/null)" || { echo "error: --mount '$m': no such path: ${spec%%:*}" >&2; exit 1; }
+        [[ -n "$mpath" ]] || { echo "error: $src '$m': ':' shorthand requires a path (:PATH[:OPTIONS])" >&2; exit 1; }
+        mpath="$(realpath "$mpath" 2>/dev/null)" || { echo "error: $src '$m': no such path: ${spec%%:*}" >&2; exit 1; }
         m="${mpath}:${mpath}${mopts}"
     fi
     # A spec with no ':' is a docker *anonymous volume* -- an empty directory
     # that silently discards its contents when the container exits. Nobody
     # wants that from --mount, and it reads like a bind mount, so reject it.
     if [[ "$m" != *:* ]]; then
-        echo "error: --mount '$m': missing ':'" >&2
+        echo "error: $src '$m': missing ':'" >&2
         echo "       Use HOST:CONTAINER, or ':$m' to mount it at the same path." >&2
         exit 1
     fi
+
+    dest="$(mount_dest "$m")"
+    builtin=""
+    for j in "${!BUILTIN_DESTS[@]}"; do
+        [[ "${BUILTIN_DESTS[$j]}" == "$dest" ]] && { builtin="${BUILTIN_DESCS[$j]}"; break; }
+    done
+    if [[ -n "$builtin" ]]; then
+        echo "warning: ignoring mount '$m' from $src: codebox already mounts $builtin at $dest" >&2
+        continue
+    fi
+    replaced=false
+    for j in "${!MOUNT_DESTS[@]}"; do
+        [[ "${MOUNT_DESTS[$j]}" == "$dest" ]] || continue
+        if [[ "${MOUNT_SPECS[$j]}" != "$m" ]]; then
+            echo "warning: mount '$m' from $src replaces '${MOUNT_SPECS[$j]}' from ${MOUNT_SRCS[$j]} at $dest" >&2
+        fi
+        MOUNT_SPECS[$j]="$m"; MOUNT_SRCS[$j]="$src"
+        replaced=true
+        break
+    done
+    if ! $replaced; then
+        MOUNT_SPECS+=("$m"); MOUNT_DESTS+=("$dest"); MOUNT_SRCS+=("$src")
+    fi
+done
+EXTRA_VOLUME_ARGS=()
+for m in "${MOUNT_SPECS[@]}"; do
     # A host part that is a path (not a named volume) gets the same home
     # directory check as the target directory.
     mhost="${m%%:*}"

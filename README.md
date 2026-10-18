@@ -168,6 +168,13 @@ CODEBOX_MOUNTS=":/srv/data:ro ../shared:/shared"
 
 `codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts` or `codebox-tailclaude`.
 
+## Duplicate mounts
+
+Docker refuses to start a container when two mounts use the same container path, so `codebox` resolves duplicates before starting it:
+
+- When two extra mounts (from the user env file, `.env.codebox` or `--mount`) use the same container path, the later one is used, in that order, so `--mount` wins. codebox prints a warning naming both mounts, unless the two are identical.
+- An extra mount at a container path that codebox mounts itself (the project directory, the agent's config directory, `~/.gitconfig`) is ignored with a warning, because the agent needs those mounts.
+
 ## Trusting a project's files
 
 `Dockerfile.codebox` and `.env.codebox` come from the project directory, which may be a repository you cloned. A `Dockerfile.codebox` runs arbitrary code at build time, and the image it builds can read the credentials mounted into the container. A `.env.codebox` can mount any host path into the container through `CODEBOX_MOUNTS`.
