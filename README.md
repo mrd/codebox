@@ -164,6 +164,10 @@ These keys are refused, because they could redirect API traffic, along with the 
 CODEBOX_MOUNTS=":/srv/data:ro ../shared:/shared"
 ```
 
+## User-wide environment: `~/.config/codebox/env`
+
+`codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts` or `codebox-tailclaude`.
+
 ## Trusting a project's files
 
 `Dockerfile.codebox` and `.env.codebox` come from the project directory, which may be a repository you cloned. A `Dockerfile.codebox` runs arbitrary code at build time, and the image it builds can read the credentials mounted into the container. A `.env.codebox` can mount any host path into the container through `CODEBOX_MOUNTS`.

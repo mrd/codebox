@@ -91,6 +91,10 @@
 #   shorthand accepted by --mount works here too. Because a mount can expose
 #   any host path, codebox prompts before using a .env.codebox it has not
 #   seen before, the same way it does for Dockerfile.codebox (see below).
+#   A user-wide file, ~/.config/codebox/env (or $XDG_CONFIG_HOME/codebox/env),
+#   is read the same way before .env.codebox, without a prompt and without
+#   the sensitive-key refusal. Values from .env.codebox override it, except
+#   for the refused keys; CODEBOX_MOUNTS from both files are combined.
 #
 # If DIR contains a Dockerfile.codebox, it is built on top of the base image
 # to add project-specific dependencies. It can start with:
@@ -311,6 +315,9 @@ fi
 # (directory, file SHA) so an unchanged file is not re-prompted; editing it
 # re-prompts.
 TRUST_STORE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/trusted"
+# User-wide environment file, loaded before the project's .env.codebox. It is
+# the user's own file, so it needs no trust prompt.
+USER_ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/codebox/env"
 require_trust() {
     local file="$1" desc="$2" key
     key="$(sha256sum "$file" | cut -d' ' -f1)  ${TARGET_DIR}"
@@ -611,35 +618,42 @@ for var in "${ENV_VARS[@]}"; do
     fi
 done
 
-# Load .env.codebox from the target directory if present.
+# Load environment files: first the user-wide one, then the project's.
 #
 # .env.codebox lives inside the (potentially untrusted) target directory, so a
 # cloned repo could ship one. Refuse keys that would redirect API traffic or
 # relocate the config dir — e.g. ANTHROPIC_BASE_URL pointing at an attacker host
-# would exfiltrate the API key / OAuth token in request headers. Forwarded keys
-# are printed so they are visible before the container starts.
+# would exfiltrate the API key / OAuth token in request headers. The user-wide
+# file is the user's own, so the blocklist does not apply to it. Docker uses
+# the last -e for a key, so the project's values override the user's, except
+# for blocked keys, which only the user file can set. CODEBOX_MOUNTS from both
+# files are combined. Forwarded keys are printed so they are visible before the
+# container starts.
 ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME)
-ENV_FILE="$TARGET_DIR/.env.codebox"
-if [[ -f "$ENV_FILE" ]]; then
+load_env_file() {
+    local env_file="$1" use_blocklist="$2" label="$3"
+    local key value blocked b m mounts
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
         [[ -z "$key" || "$key" =~ ^# ]] && continue
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
-        blocked=false
-        for b in "${ENV_BLOCKLIST[@]}"; do
-            [[ "$key" == "$b" ]] && { blocked=true; break; }
-        done
-        if $blocked; then
-            echo "warning: ignoring '$key' from .env.codebox (blocked sensitive key)" >&2
-            continue
+        if $use_blocklist; then
+            blocked=false
+            for b in "${ENV_BLOCKLIST[@]}"; do
+                [[ "$key" == "$b" ]] && { blocked=true; break; }
+            done
+            if $blocked; then
+                echo "warning: ignoring '$key' from $label (blocked sensitive key)" >&2
+                continue
+            fi
         fi
-        echo "forwarding env from .env.codebox: $key" >&2
+        echo "forwarding env from $label: $key" >&2
         ENV_ARGS+=(-e "${key}=${value}")
-    done < "$ENV_FILE"
+    done < "$env_file"
 
-    # Extra mounts from CODEBOX_MOUNTS in .env.codebox
+    # Extra mounts from CODEBOX_MOUNTS
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
@@ -656,7 +670,13 @@ if [[ -f "$ENV_FILE" ]]; then
             done <<< "$value"
         fi
         break
-    done < "$ENV_FILE"
+    done < "$env_file"
+}
+if [[ -f "$USER_ENV_FILE" ]]; then
+    load_env_file "$USER_ENV_FILE" false "$USER_ENV_FILE"
+fi
+if [[ -f "$TARGET_DIR/.env.codebox" ]]; then
+    load_env_file "$TARGET_DIR/.env.codebox" true ".env.codebox"
 fi
 
 # Credential/config mounts.
