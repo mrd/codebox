@@ -705,12 +705,8 @@ if $USE_TAILSCALE; then
         fi
         echo "Building $TS_RUN_IMAGE..." >&2
         docker build "${CACHE_ARG[@]}" \
-            --build-arg "RUN_IMAGE=$RUN_IMAGE" \
-            --build-arg "TS_IMAGE=$TS_IMAGE" \
             --label "codebox.base.id=${RUN_ID}" \
-            -t "$TS_RUN_IMAGE" - <<'DOCKERFILE'
-ARG RUN_IMAGE
-ARG TS_IMAGE
+            -t "$TS_RUN_IMAGE" - <<DOCKERFILE
 FROM ${TS_IMAGE} AS tailscale
 FROM ${RUN_IMAGE}
 USER root
