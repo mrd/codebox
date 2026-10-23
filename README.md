@@ -1,6 +1,6 @@
 # codebox
 
-Run Claude Code, OpenCode, or OpenAI Codex in an isolated Docker container. Your project directory is mounted read-write, but the container has no access to the rest of your host filesystem.
+Run Claude Code, OpenCode, OpenAI Codex, or Polytoken in an isolated Docker container. Your project directory is mounted read-write, but the container has no access to the rest of your host filesystem.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Make sure `~/.local/bin` is in your `PATH`.
 codebox [OPTIONS] [DIR] [-- ARGS...]
 ```
 
-`DIR` defaults to the current working directory. `ARGS` are passed through to `claude`, `opencode`, or `codex`.
+`DIR` defaults to the current working directory. `ARGS` are passed through to `claude`, `opencode`, `codex`, or `polytoken`.
 
 **Options:**
 
@@ -40,13 +40,14 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `--allow-home` | Skip the confirmation prompt when `DIR` or a `--mount` host path is your home directory or an ancestor of it |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
 | `--codex` | Use [OpenAI Codex](https://chatgpt.com/codex) instead of Claude Code |
+| `--polytoken` | Use [Polytoken](https://polytoken.dev) instead of Claude Code |
 | `--tailscale` | Put the container on your tailnet through a Tailscale sidecar container (see [Tailscale](#tailscale)) |
 | `--serve PORT` | With `--tailscale`, make `PORT` in the container reachable from the tailnet over HTTP on port 80 |
 | `--serve-https` | With `--serve`, use HTTPS on port 443 instead. The tailnet must have HTTPS certificates enabled |
 | `--init` | Write a `Dockerfile.codebox` template into `DIR` |
 | `-h`, `--help` | Show help |
 
-`--opencode` and `--codex` are mutually exclusive.
+`--opencode`, `--codex` and `--polytoken` are mutually exclusive.
 
 **Examples:**
 
@@ -59,6 +60,9 @@ codebox --opencode
 
 # Run OpenAI Codex in the current directory
 codebox --codex
+
+# Run Polytoken in the current directory
+codebox --polytoken
 
 # Run in a specific project
 codebox ~/src/myproject
@@ -85,6 +89,7 @@ The first run builds a base image. Its Dockerfile is inside the `codebox` script
 | Claude Code (default) | `codebox` | `codebox--base-<hash of IMAGE>` |
 | OpenCode (`--opencode`) | `codebox-opencode` | `codebox-opencode--base-<hash>` |
 | Codex (`--codex`) | `codebox-codex` | `codebox-codex--base-<hash>` |
+| Polytoken (`--polytoken`) | `codebox-polytoken` | `codebox-polytoken--base-<hash>` |
 
 The container then runs with these settings:
 
@@ -93,7 +98,7 @@ The container then runs with these settings:
 - All Linux capabilities are dropped (`--cap-drop ALL`), and processes cannot gain new privileges (`no-new-privileges`).
 - A small init process runs as PID 1 (`--init`), with the agent under it. This is what lets the agent suspend itself (see [Suspending with Ctrl-Z](#suspending-with-ctrl-z)).
 - Your `~/.gitconfig` is mounted read-only, so commits use your identity. Pass `--no-gitconfig` to skip it.
-- These variables are forwarded from your environment when set: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and `CLAUDE_CONFIG_DIR` for Claude Code; `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for OpenCode; `OPENAI_API_KEY` and `OPENAI_BASE_URL` for Codex.
+- These variables are forwarded from your environment when set: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and `CLAUDE_CONFIG_DIR` for Claude Code; `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for OpenCode; `OPENAI_API_KEY` and `OPENAI_BASE_URL` for Codex; `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `TERM` and `COLORTERM` for Polytoken (see [Polytoken](#polytoken)).
 - Network access is not restricted. See [Security](#security).
 
 The script exits with the agent's exit status.
@@ -104,6 +109,14 @@ If `DIR` is your home directory or contains it, codebox asks before mounting it,
 
 Codex normally sandboxes the commands it runs with bubblewrap and Landlock. That needs an unprivileged user namespace, which codebox's container does not allow. The container is already the sandbox, so codebox runs Codex with `-s danger-full-access` to turn off the inner sandbox. Codex still asks for approval before it runs commands. Pass your own `-s`/`--sandbox`, `--full-auto` or `--dangerously-bypass-approvals-and-sandbox` to override this.
 
+### Polytoken
+
+Polytoken reads provider API keys from the variables that its provider config names, such as `${OPENAI_API_KEY}`. codebox forwards `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from your environment. Put any other key in the user-wide env file, `~/.config/codebox/env`. Logins made with `polytoken auth provider login` are kept in the mounted data directory, so they persist across runs.
+
+Polytoken needs a terminal with at least 256 colours, and it checks `TERM` and `COLORTERM` to find out. `docker run -t` sets `TERM=xterm`, so codebox passes your `TERM` and `COLORTERM` through. If Polytoken still finds too few colours, set `POLYTOKEN_TUI_COLOR_MODE=256` or `truecolor` in the env file.
+
+The Polytoken binary in the image belongs to root, so `polytoken update` cannot replace it. Run `codebox --polytoken -r` to install the newest version. The image sets `POLYTOKEN_SKIP_UPDATE_CHECK=1`, so Polytoken does not offer updates.
+
 ## Credentials
 
 By default codebox mounts your real config directory read-write, so that login state and preferences persist across runs:
@@ -113,6 +126,7 @@ By default codebox mounts your real config directory read-write, so that login s
 | Claude Code | `~/.claude` and `~/.claude.json` | `~/.claude-codebox` |
 | OpenCode | `~/.config/opencode` | `~/.config/opencode-codebox` |
 | Codex | `~/.codex` (via `CODEX_HOME`, so it does not hide the Codex binary) | `~/.codex-codebox` |
+| Polytoken | `~/.config/polytoken` and `~/.local/share/polytoken` (provider logins, sessions and logs) | `~/.config/polytoken-codebox` and `~/.local/share/polytoken-codebox` |
 
 Mounting the real directory gives the agent your OAuth tokens. It also lets the agent change settings that your host installation reads, including Claude Code hooks, which run on the host. With `--no-credentials`, codebox mounts a separate directory instead. The sandbox keeps its own settings between runs, and your host login state is never exposed. Authenticate with `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) in that case.
 
@@ -133,7 +147,7 @@ The FROM line is optional:
 | `Dockerfile.codebox` starts with | Result |
 |----------------------------------|--------|
 | no FROM line | codebox adds `FROM` with the right base image |
-| `FROM codebox`, `FROM codebox-opencode` or `FROM codebox-codex` | used as written |
+| `FROM codebox`, `FROM codebox-opencode`, `FROM codebox-codex` or `FROM codebox-polytoken` | used as written |
 | `FROM` any other image, e.g. `FROM ubuntu:24.04` | same as `--from ubuntu:24.04`: codebox builds a base image on top of it, and points the FROM line at that base image |
 
 `--from` takes priority over the FROM line. Flags such as `--platform` and an `AS stage` suffix on the FROM line are kept.
@@ -159,7 +173,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 
 If the project directory contains a `.env.codebox`, each `KEY=VALUE` line is passed to the container as an environment variable. Lines starting with `#` are ignored. Values are used as written, so quotes are kept as part of the value (`CODEBOX_MOUNTS` is the exception). codebox prints the name of each variable it passes on.
 
-These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`, and `TS_EXTRA_ARGS` (see [Tailscale](#tailscale)).
+These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`, `POLYTOKEN_CONFIG_PATH`, `POLYTOKEN_DATA_PATH`, `POLYTOKEN_CACHE_PATH`, `POLYTOKEN_DAEMON_CREDENTIAL_FILE`, `POLYTOKEN_OUTPOST_URL`, `POLYTOKEN_OUTPOST_TOKEN`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `TS_EXTRA_ARGS` (see [Tailscale](#tailscale)). Polytoken (and OpenCode) read their config and data from under `XDG_CONFIG_HOME` and `XDG_DATA_HOME` when these are set.
 
 `CODEBOX_MOUNTS` is a space-separated list of extra bind mounts in the same format as `--mount`:
 
@@ -204,7 +218,7 @@ TS_AUTH_KEY=tskey-auth-... codebox --tailscale --serve 3000 ~/src/myproject
 
 ## Security
 
-Network access from the container is not restricted, so an agent can send your code or anything else it can read to any server. The tools are installed by piping their install scripts into a shell, so the image build trusts claude.ai, opencode.ai and chatgpt.com to serve the right scripts.
+Network access from the container is not restricted, so an agent can send your code or anything else it can read to any server. The tools are installed by piping their install scripts into a shell, so the image build trusts claude.ai, opencode.ai, chatgpt.com and get.polytoken.dev to serve the right scripts.
 
 ## Other scripts
 

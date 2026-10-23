@@ -47,7 +47,8 @@
 #                        this exposes everything under it
 #   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
 #   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
-#   --tailscale          Put the container on your tailnet through a Tailscale
+#   --polytoken          Use Polytoken (polytoken.dev) instead of Claude Code
+#   --tailscale         Put the container on your tailnet through a Tailscale
 #                        sidecar container (see Tailscale below)
 #   --serve PORT         With --tailscale, make PORT in the container reachable
 #                        from the tailnet over HTTP on port 80 (Tailscale Serve)
@@ -56,7 +57,7 @@
 #   --init               Generate a Dockerfile.codebox template in DIR
 #   -h, --help           Show this help
 #
-# --opencode and --codex are mutually exclusive.
+# --opencode, --codex and --polytoken are mutually exclusive.
 #
 # Codex sandbox: Codex normally sandboxes the commands it runs (bubblewrap /
 #   Landlock), which needs an unprivileged user namespace and cannot work
@@ -66,17 +67,21 @@
 #   --full-auto, or --dangerously-bypass-approvals-and-sandbox to override.
 #
 # DIR defaults to the current working directory.
-# ARGS are passed through to `claude`, `opencode`, or `codex`.
+# ARGS are passed through to `claude`, `opencode`, `codex`, or `polytoken`.
 #
 # Credential mounts (default):
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
 #   OpenCode:    ~/.config/opencode mounted read-write.
 #   Codex:       ~/.codex mounted read-write.
+#   Polytoken:   ~/.config/polytoken and ~/.local/share/polytoken (provider
+#                logins, sessions, logs) mounted read-write.
 #   With --no-credentials a dedicated sandbox config dir is mounted instead of
 #   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox /
-#   ~/.codex-codebox), so no host login state or host-executed hooks are
-#   exposed. Auth via ANTHROPIC_API_KEY (or OPENAI_API_KEY for Codex) in that
-#   case.
+#   ~/.codex-codebox / ~/.config/polytoken-codebox and
+#   ~/.local/share/polytoken-codebox), so no host login state or host-executed
+#   hooks are exposed. Auth via ANTHROPIC_API_KEY (or OPENAI_API_KEY for Codex)
+#   in that case. Polytoken reads API keys from the variables its provider
+#   config names, so put those in the user-wide env file (see Environment).
 #
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
 #   operations (commit, etc.) use your host identity. Use --no-gitconfig to skip.
@@ -89,8 +94,9 @@
 #
 # Environment: If the target directory contains a .env.codebox file, each
 #   KEY=VALUE line is forwarded as an environment variable to the container.
-#   Sensitive keys (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN,
-#   CLAUDE_CONFIG_DIR) are refused since .env.codebox may come from an untrusted
+#   Sensitive keys (API keys, API base URLs and config locations, such as
+#   ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, CLAUDE_CONFIG_DIR, CODEX_HOME and
+#   POLYTOKEN_CONFIG_PATH) are refused since .env.codebox may come from an untrusted
 #   target directory; forwarded keys are printed before the container starts.
 #   CODEBOX_MOUNTS is treated as a space-separated list of HOST:CONTAINER mount
 #   specifications and is forwarded as extra bind mounts. The :PATH identity
@@ -128,6 +134,7 @@
 #   FROM codebox          (Claude Code, the default)
 #   FROM codebox-opencode (with --opencode)
 #   FROM codebox-codex    (with --codex)
+#   FROM codebox-polytoken (with --polytoken)
 #   FROM ubuntu:24.04     (any image — codebox installs the AI tool on top and
 #                          rewrites the FROM line to the resulting codebox image)
 #   (no FROM line)      (the codebox base image is prepended for you)
@@ -180,6 +187,7 @@ NO_GITCONFIG=false
 NO_DOCKERFILE=false
 USE_OPENCODE=false
 USE_CODEX=false
+USE_POLYTOKEN=false
 TRUST=false
 ALLOW_HOME=false
 USE_TAILSCALE=false
@@ -217,6 +225,7 @@ while [[ $# -gt 0 ]]; do
                              CLI_MOUNTS+=("$2"); shift 2 ;;
         --opencode)          USE_OPENCODE=true; shift ;;
         --codex)             USE_CODEX=true; shift ;;
+        --polytoken)         USE_POLYTOKEN=true; shift ;;
         --tailscale)         USE_TAILSCALE=true; shift ;;
         --serve)             [[ $# -gt 1 ]] || { echo "error: --serve requires a PORT argument" >&2; exit 1; }
                              SERVE_PORT="$2"; shift 2 ;;
@@ -267,10 +276,15 @@ guard_home() {
 }
 guard_home "$TARGET_DIR"
 
-if $USE_OPENCODE && $USE_CODEX; then
-    echo "error: --opencode and --codex are mutually exclusive" >&2
+_agents=0
+for _flag in "$USE_OPENCODE" "$USE_CODEX" "$USE_POLYTOKEN"; do
+    $_flag && _agents=$((_agents + 1))
+done
+if (( _agents > 1 )); then
+    echo "error: --opencode, --codex and --polytoken are mutually exclusive" >&2
     exit 1
 fi
+unset _agents _flag
 
 if [[ -n "$SERVE_PORT" ]] && ! $USE_TAILSCALE; then
     echo "error: --serve requires --tailscale" >&2
@@ -292,6 +306,9 @@ if $USE_OPENCODE; then
 elif $USE_CODEX; then
     IMAGE_NAME="codebox-codex"
     TOOL="codex"
+elif $USE_POLYTOKEN; then
+    IMAGE_NAME="codebox-polytoken"
+    TOOL="polytoken"
 fi
 
 # If a non-default base image is requested, derive a unique image name so the
@@ -322,6 +339,8 @@ if [[ "$ACTION" == "init" ]]; then
         FROM_LINE="FROM codebox-opencode"
     elif $USE_CODEX; then
         FROM_LINE="FROM codebox-codex"
+    elif $USE_POLYTOKEN; then
+        FROM_LINE="FROM codebox-polytoken"
     else
         FROM_LINE="FROM codebox"
     fi
@@ -442,7 +461,7 @@ $NO_CACHE && CACHE_ARG=(--no-cache)
 
 # Build base image if missing or rebuild requested
 BASE_IMAGE_NAME="${IMAGE_NAME}${BASE_TAG_SUFFIX}"
-if ! $USE_OPENCODE && ! $USE_CODEX && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+if ! $USE_OPENCODE && ! $USE_CODEX && ! $USE_POLYTOKEN && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
     echo "Building $BASE_IMAGE_NAME..." >&2
     docker build "${CACHE_ARG[@]}" \
         --build-arg "BASE_IMAGE=$BASE_IMAGE" \
@@ -517,6 +536,35 @@ ENTRYPOINT ["codex"]
 DOCKERFILE
 fi
 
+# The Polytoken binary is installed as root at build time, so the container
+# user cannot replace it with `polytoken update`; `codebox -r` installs a newer
+# one instead. POLYTOKEN_SKIP_UPDATE_CHECK stops Polytoken offering updates.
+if $USE_POLYTOKEN && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
+    echo "Building $BASE_IMAGE_NAME..." >&2
+    docker build "${CACHE_ARG[@]}" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+ENV POLYTOKEN_SKIP_UPDATE_CHECK=1
+
+RUN curl -fsS https://get.polytoken.dev | bash
+
+ENTRYPOINT ["polytoken"]
+DOCKERFILE
+fi
+
 # Check for a project-specific Dockerfile (opt-out via --no-dockerfile)
 PROJECT_DOCKERFILE="$TARGET_DIR/Dockerfile.codebox"
 RUN_IMAGE="$BASE_IMAGE_NAME"
@@ -531,7 +579,8 @@ if ! $NO_DOCKERFILE && [[ -f "$PROJECT_DOCKERFILE" ]]; then
     _df_from="$(awk 'tolower($1) == "from" { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit } }' \
         "$PROJECT_DOCKERFILE")"
     if ! $FROM_EXPLICIT && [[ -n "$_df_from" ]] \
-            && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" && "$_df_from" != "codebox-codex" ]]; then
+            && [[ "$_df_from" != "codebox" && "$_df_from" != "codebox-opencode" && "$_df_from" != "codebox-codex" \
+                  && "$_df_from" != "codebox-polytoken" ]]; then
         BASE_IMAGE="$_df_from"
         BASE_TAG_SUFFIX="$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)"
         BASE_TAG_SUFFIX="--base-${BASE_TAG_SUFFIX}"
@@ -583,6 +632,29 @@ ENV PATH="/home/sandbox/.local/bin:$PATH"
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
 
 ENTRYPOINT ["codex"]
+DOCKERFILE
+            elif $USE_POLYTOKEN; then
+                docker build "${CACHE_ARG[@]}" \
+                    --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+                    -t "$BASE_IMAGE_NAME" - <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/sandbox \
+    && chmod 777 /home/sandbox
+
+ENV HOME=/home/sandbox
+ENV PATH="/home/sandbox/.local/bin:$PATH"
+ENV POLYTOKEN_SKIP_UPDATE_CHECK=1
+
+RUN curl -fsS https://get.polytoken.dev | bash
+
+ENTRYPOINT ["polytoken"]
 DOCKERFILE
             else
                 docker build "${CACHE_ARG[@]}" \
@@ -721,6 +793,13 @@ fi
 ENV_ARGS=()
 if $USE_CODEX; then
     ENV_VARS=(OPENAI_API_KEY OPENAI_BASE_URL)
+elif $USE_POLYTOKEN; then
+    # Polytoken's provider config names the variables it reads keys from
+    # (e.g. ${OPENAI_API_KEY}), so forward the two common ones. It refuses to
+    # start on a terminal with fewer than 256 colours and detects that from
+    # TERM and COLORTERM, but `docker run -t` sets TERM=xterm, so pass the
+    # host's values through.
+    ENV_VARS=(ANTHROPIC_API_KEY OPENAI_API_KEY TERM COLORTERM)
 else
     ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL)
     if ! $USE_OPENCODE; then
@@ -752,7 +831,9 @@ done
 TS_AUTH_KEY_VALUE="${TS_AUTH_KEY:-}"
 TS_AUTH_KEY_SRC="your environment"
 TS_EXTRA_ARGS_VALUE="${TS_EXTRA_ARGS:-}"
-ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME TS_EXTRA_ARGS)
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME
+    POLYTOKEN_CONFIG_PATH POLYTOKEN_DATA_PATH POLYTOKEN_CACHE_PATH POLYTOKEN_DAEMON_CREDENTIAL_FILE
+    POLYTOKEN_OUTPOST_URL POLYTOKEN_OUTPOST_TOKEN XDG_CONFIG_HOME XDG_DATA_HOME TS_EXTRA_ARGS)
 load_env_file() {
     local env_file="$1" use_blocklist="$2" label="$3"
     local key value blocked b m mounts
@@ -848,6 +929,20 @@ elif $USE_OPENCODE; then
     fi
     mkdir -p "$OPENCODE_CONFIG_HOST_DIR"
     CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode")
+elif $USE_POLYTOKEN; then
+    # Polytoken keeps its settings in the config dir, and provider logins
+    # (OAuth tokens) in the data dir alongside sessions and logs, so both are
+    # mounted. Its cache only holds model catalogs, which it fetches again.
+    if $NO_CREDS; then
+        POLYTOKEN_CONFIG_HOST_DIR="${HOME}/.config/polytoken-codebox"
+        POLYTOKEN_DATA_HOST_DIR="${HOME}/.local/share/polytoken-codebox"
+    else
+        POLYTOKEN_CONFIG_HOST_DIR="${HOME}/.config/polytoken"
+        POLYTOKEN_DATA_HOST_DIR="${HOME}/.local/share/polytoken"
+    fi
+    mkdir -p "$POLYTOKEN_CONFIG_HOST_DIR" "$POLYTOKEN_DATA_HOST_DIR"
+    CRED_MOUNTS=(-v "$POLYTOKEN_CONFIG_HOST_DIR:/home/sandbox/.config/polytoken"
+                 -v "$POLYTOKEN_DATA_HOST_DIR:/home/sandbox/.local/share/polytoken")
 else
     if $NO_CREDS; then
         CLAUDE_HOST_DIR="${HOME}/.claude-codebox"
