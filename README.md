@@ -32,7 +32,7 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `-r`, `--rebuild` | Rebuild the Docker image(s), using the layer cache |
 | `-R`, `--force-rebuild` | Rebuild the Docker image(s) without the layer cache |
 | `--from IMAGE` | Build on `IMAGE` instead of `debian:trixie-slim`. The image needs `curl`, `bash` and `ca-certificates` |
-| `--no-credentials` | Mount a separate sandbox config directory instead of your real one (see [Credentials](#credentials)); authenticate with `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) |
+| `--no-credentials` | Mount a separate sandbox config directory instead of your real one (see [Credentials](#credentials)) |
 | `--mount HOST:CONTAINER` | Additional bind mount; repeatable. `:PATH` is shorthand for an identity mount (`:/data` = `/data:/data`), with options appended as `:/data:ro`. Also reads `CODEBOX_MOUNTS` from `.env.codebox` |
 | `--no-gitconfig` | Do not mount your `~/.gitconfig` into the container |
 | `--no-dockerfile` | Ignore the project's `Dockerfile.codebox` and run the base image instead |
@@ -77,8 +77,11 @@ codebox --mount :/srv/data:ro ~/src/myproject
 # Build on Ubuntu instead of Debian
 codebox --from ubuntu:24.04 ~/src/myproject
 
-# Maximum isolation: no OAuth token exposed, auth via API key
+# Maximum isolation: host login, CLAUDE.md and memory not exposed, auth via API key
 ANTHROPIC_API_KEY=sk-... codebox --no-credentials ~/src/myproject
+
+# The same isolation with a Claude subscription (token from `claude setup-token`)
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat... codebox --no-credentials ~/src/myproject
 ```
 
 ## How it works
@@ -99,7 +102,7 @@ The container then runs with these settings:
 - All Linux capabilities are dropped (`--cap-drop ALL`), and processes cannot gain new privileges (`no-new-privileges`).
 - A small init process runs as PID 1 (`--init`), with the agent under it. This is what lets the agent suspend itself (see [Suspending with Ctrl-Z](#suspending-with-ctrl-z)).
 - Your `~/.gitconfig` is mounted read-only, so commits use your identity. Pass `--no-gitconfig` to skip it.
-- These variables are forwarded from your environment when set: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and `CLAUDE_CONFIG_DIR` for Claude Code; `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for OpenCode; `OPENAI_API_KEY` and `OPENAI_BASE_URL` for Codex; `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `TERM` and `COLORTERM` for Polytoken (see [Polytoken](#polytoken)).
+- These variables are forwarded from your environment when set: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code; `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for OpenCode; `OPENAI_API_KEY` and `OPENAI_BASE_URL` for Codex; `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `TERM` and `COLORTERM` for Polytoken (see [Polytoken](#polytoken)).
 - Network access is not restricted. See [Security](#security).
 
 The script exits with the agent's exit status.
@@ -129,7 +132,11 @@ By default codebox mounts your real config directory read-write, so that login s
 | Codex | `~/.codex` (via `CODEX_HOME`, so it does not hide the Codex binary) | `~/.codex-codebox` |
 | Polytoken | `~/.config/polytoken` and `~/.local/share/polytoken` (provider logins, sessions and logs) | `~/.config/polytoken-codebox` and `~/.local/share/polytoken-codebox` |
 
-Mounting the real directory gives the agent your OAuth tokens. It also lets the agent change settings that your host installation reads, including Claude Code hooks, which run on the host. With `--no-credentials`, codebox mounts a separate directory instead. The sandbox keeps its own settings between runs, and your host login state is never exposed. Authenticate with `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for Codex) in that case.
+Mounting the real directory gives the agent your OAuth tokens. It also lets the agent change settings that your host installation reads, including Claude Code hooks, which run on the host. With `--no-credentials`, codebox mounts a separate directory instead. The sandbox keeps its own settings between runs, and your host login state is never exposed. Neither are your host `CLAUDE.md` and Claude Code memory, because both live in `~/.claude`. You can authenticate in three ways in that case:
+
+- Log in inside the container (for Claude Code, `/login`). The login is saved in the sandbox directory, so it is kept between runs and is separate from your host login.
+- Set `ANTHROPIC_API_KEY` (`OPENAI_API_KEY` for Codex).
+- For a Claude subscription without logging in, run `claude setup-token` on the host and set the token it prints as `CLAUDE_CODE_OAUTH_TOKEN`. Put it in your environment or in the user-wide env file, `~/.config/codebox/env`. A project's `.env.codebox` may not set it.
 
 ## Suspending with Ctrl-Z
 
@@ -174,7 +181,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 
 If the project directory contains a `.env.codebox`, each `KEY=VALUE` line is passed to the container as an environment variable. Lines starting with `#` are ignored. Values are used as written, so quotes are kept as part of the value (`CODEBOX_MOUNTS` is the exception). codebox prints the name of each variable it passes on.
 
-These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`, `POLYTOKEN_CONFIG_PATH`, `POLYTOKEN_DATA_PATH`, `POLYTOKEN_CACHE_PATH`, `POLYTOKEN_DAEMON_CREDENTIAL_FILE`, `POLYTOKEN_OUTPOST_URL`, `POLYTOKEN_OUTPOST_TOKEN`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `TS_EXTRA_ARGS` (see [Tailscale](#tailscale)). Polytoken (and OpenCode) read their config and data from under `XDG_CONFIG_HOME` and `XDG_DATA_HOME` when these are set.
+These keys are refused, because they could redirect API traffic, along with the credentials it carries, or move the config directory: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME`, `POLYTOKEN_CONFIG_PATH`, `POLYTOKEN_DATA_PATH`, `POLYTOKEN_CACHE_PATH`, `POLYTOKEN_DAEMON_CREDENTIAL_FILE`, `POLYTOKEN_OUTPOST_URL`, `POLYTOKEN_OUTPOST_TOKEN`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `TS_EXTRA_ARGS` (see [Tailscale](#tailscale)). Polytoken (and OpenCode) read their config and data from under `XDG_CONFIG_HOME` and `XDG_DATA_HOME` when these are set.
 
 `CODEBOX_MOUNTS` is a space-separated list of extra bind mounts in the same format as `--mount`:
 

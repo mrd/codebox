@@ -28,8 +28,8 @@
 #   --from IMAGE         Use IMAGE as the base Docker image instead of the
 #                        default debian:trixie-slim. The image must have curl,
 #                        bash, and ca-certificates available.
-#   --no-credentials     Do not mount credential/config directories; requires
-#                        ANTHROPIC_API_KEY for auth
+#   --no-credentials     Mount a separate sandbox config directory instead of
+#                        your real one (see Credential mounts)
 #   --mount HOST:CONTAINER
 #                        Additional bind mount (can be repeated; also reads
 #                        CODEBOX_MOUNTS from .env.codebox). As a shorthand,
@@ -80,9 +80,13 @@
 #   With --no-credentials a dedicated sandbox config dir is mounted instead of
 #   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox /
 #   ~/.codex-codebox / ~/.config/polytoken-codebox and
-#   ~/.local/share/polytoken-codebox), so no host login state or host-executed
-#   hooks are exposed. Auth via ANTHROPIC_API_KEY (or OPENAI_API_KEY for Codex)
-#   in that case. Polytoken reads API keys from the variables its provider
+#   ~/.local/share/polytoken-codebox), so no host login state, host-executed
+#   hooks, CLAUDE.md or memory are exposed. To authenticate in that case, log
+#   in inside the container (the login is kept in the sandbox config dir), or
+#   set ANTHROPIC_API_KEY (OPENAI_API_KEY for Codex). For a Claude
+#   subscription without logging in, create a token on the host with
+#   `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN, e.g. in the
+#   user-wide env file (see Environment). Polytoken reads API keys from the variables its provider
 #   config names, so put those in the user-wide env file (see Environment).
 #
 # Git config: ~/.gitconfig is mounted read-only into the container so that git
@@ -808,7 +812,7 @@ elif $USE_POLYTOKEN; then
 else
     ENV_VARS=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL)
     if ! $USE_OPENCODE; then
-        ENV_VARS+=(CLAUDE_CONFIG_DIR)
+        ENV_VARS+=(CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN)
     fi
 fi
 for var in "${ENV_VARS[@]}"; do
@@ -836,7 +840,7 @@ done
 TS_AUTH_KEY_VALUE="${TS_AUTH_KEY:-}"
 TS_AUTH_KEY_SRC="your environment"
 TS_EXTRA_ARGS_VALUE="${TS_EXTRA_ARGS:-}"
-ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME
+ENV_BLOCKLIST=(ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY OPENAI_BASE_URL CODEX_HOME
     POLYTOKEN_CONFIG_PATH POLYTOKEN_DATA_PATH POLYTOKEN_CACHE_PATH POLYTOKEN_DAEMON_CREDENTIAL_FILE
     POLYTOKEN_OUTPOST_URL POLYTOKEN_OUTPOST_TOKEN XDG_CONFIG_HOME XDG_DATA_HOME TS_EXTRA_ARGS)
 load_env_file() {
@@ -911,7 +915,8 @@ done
 # stores settings.json (which can define hooks that run on the host) and is
 # mounted read-write. Pointing the container at a separate dir keeps cross-run
 # persistence for the sandbox without exposing host login state or letting the
-# sandbox write host-executed hooks. Auth is then expected via ANTHROPIC_API_KEY.
+# sandbox write host-executed hooks. Auth is then a login made inside the
+# sandbox, ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`).
 if $USE_CODEX; then
     if $NO_CREDS; then
         CODEX_CONFIG_HOST_DIR="${HOME}/.codex-codebox"
