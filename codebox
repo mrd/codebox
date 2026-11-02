@@ -39,7 +39,9 @@
 #   --no-gitconfig       Do not mount host ~/.gitconfig into the container
 #   --no-dockerfile      Ignore the directory's Dockerfile.codebox and run the
 #                        base image instead
-#   --trust              Trust this directory's Dockerfile.codebox and
+#   --no-user-config     Do not read the user-wide env file
+#                        (~/.config/codebox/env; see Environment)
+#   --trust             Trust this directory's Dockerfile.codebox and
 #                        .env.codebox without prompting (needed for
 #                        non-interactive use)
 #   --allow-home         Allow DIR or a --mount host path to be your home
@@ -107,6 +109,7 @@
 #   is read the same way before .env.codebox, without a prompt and without
 #   the sensitive-key refusal. Values from .env.codebox override it, except
 #   for the refused keys; CODEBOX_MOUNTS from both files are combined.
+#   --no-user-config skips the user-wide file.
 #   When two extra mounts share a container path, the later one is used (user
 #   file, then .env.codebox, then --mount), with a warning. An extra mount at
 #   a path codebox mounts itself (DIR, the agent config, ~/.gitconfig) is
@@ -185,6 +188,7 @@ NO_CACHE=false
 NO_CREDS=false
 NO_GITCONFIG=false
 NO_DOCKERFILE=false
+NO_USER_CONFIG=false
 USE_OPENCODE=false
 USE_CODEX=false
 USE_POLYTOKEN=false
@@ -219,6 +223,7 @@ while [[ $# -gt 0 ]]; do
         --no-credentials)    NO_CREDS=true; shift ;;
         --no-gitconfig)      NO_GITCONFIG=true; shift ;;
         --no-dockerfile)     NO_DOCKERFILE=true; shift ;;
+        --no-user-config)    NO_USER_CONFIG=true; shift ;;
         --trust)             TRUST=true; shift ;;
         --allow-home)        ALLOW_HOME=true; shift ;;
         --mount)             [[ $# -gt 1 ]] || { echo "error: --mount requires HOST:CONTAINER argument" >&2; exit 1; }
@@ -887,7 +892,7 @@ load_env_file() {
         break
     done < "$env_file"
 }
-if [[ -f "$USER_ENV_FILE" ]]; then
+if ! $NO_USER_CONFIG && [[ -f "$USER_ENV_FILE" ]]; then
     load_env_file "$USER_ENV_FILE" false "$USER_ENV_FILE"
 fi
 if [[ -f "$TARGET_DIR/.env.codebox" ]]; then

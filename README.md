@@ -36,6 +36,7 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `--mount HOST:CONTAINER` | Additional bind mount; repeatable. `:PATH` is shorthand for an identity mount (`:/data` = `/data:/data`), with options appended as `:/data:ro`. Also reads `CODEBOX_MOUNTS` from `.env.codebox` |
 | `--no-gitconfig` | Do not mount your `~/.gitconfig` into the container |
 | `--no-dockerfile` | Ignore the project's `Dockerfile.codebox` and run the base image instead |
+| `--no-user-config` | Do not read the user-wide env file, `~/.config/codebox/env` |
 | `--trust` | Use the project's `Dockerfile.codebox` and `.env.codebox` without the trust prompt (needed when there is no terminal, e.g. in scripts) |
 | `--allow-home` | Skip the confirmation prompt when `DIR` or a `--mount` host path is your home directory or an ancestor of it |
 | `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
@@ -183,7 +184,7 @@ CODEBOX_MOUNTS=":/srv/data:ro ../shared:/shared"
 
 ## User-wide environment: `~/.config/codebox/env`
 
-`codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts`, `codebox-tailclaude` or `codebox-web`.
+`codebox` also reads `~/.config/codebox/env` (or `$XDG_CONFIG_HOME/codebox/env`) in the same format, before the project's `.env.codebox`. You own this file, so codebox uses it without a trust prompt, and it may set the keys that `.env.codebox` is refused. When both files set the same key, the project's value is used, unless the key is one of the refused keys. The mounts in `CODEBOX_MOUNTS` from both files are added together. This file is read by `codebox` only, not by `codebox-ts`, `codebox-tailclaude` or `codebox-web`. Pass `--no-user-config` to run without it.
 
 ## Duplicate mounts
 
