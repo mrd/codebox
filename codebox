@@ -56,6 +56,7 @@
 #                        from the tailnet over HTTP on port 80 (Tailscale Serve)
 #   --serve-https        With --serve, use HTTPS on port 443 instead of HTTP
 #                        (needs HTTPS certificates enabled for the tailnet)
+#   --headless           Run without a terminal (see Headless mode below)
 #   --init               Generate a Dockerfile.codebox template in DIR
 #   -h, --help           Show this help
 #
@@ -97,6 +98,17 @@
 #   `fg` re-attaches; the container keeps running while suspended. When the
 #   agent handles Ctrl-Z itself, as Claude Code does, it stays stopped inside
 #   the container until `fg` resumes it.)
+#
+# Headless mode: --headless runs the container without a tty, for scripts and
+#   cron jobs. stdin is passed to the agent, its output goes to stdout and
+#   stderr, and codebox exits with the agent's exit status. Ctrl-Z job control
+#   is off. codebox adds no agent flags, so pass the agent's own
+#   non-interactive command or flag, e.g. `codebox --headless DIR -- -p "PROMPT"`
+#   for Claude Code, `-- exec "PROMPT"` for Codex or `-- run "PROMPT"` for
+#   OpenCode. Nobody can answer permission prompts, so also pass the agent's
+#   permission flags (e.g. --allowedTools or --dangerously-skip-permissions)
+#   when the task needs them. A Dockerfile.codebox or .env.codebox that has
+#   not been trusted needs --trust.
 #
 # Environment: If the target directory contains a .env.codebox file, each
 #   KEY=VALUE line is forwarded as an environment variable to the container.
@@ -201,6 +213,7 @@ ALLOW_HOME=false
 USE_TAILSCALE=false
 SERVE_PORT=""
 SERVE_HTTPS=false
+HEADLESS=false
 BASE_IMAGE="debian:trixie-slim"
 FROM_EXPLICIT=false
 ACTION="up"
@@ -239,6 +252,7 @@ while [[ $# -gt 0 ]]; do
         --serve)             [[ $# -gt 1 ]] || { echo "error: --serve requires a PORT argument" >&2; exit 1; }
                              SERVE_PORT="$2"; shift 2 ;;
         --serve-https)       SERVE_HTTPS=true; shift ;;
+        --headless)          HEADLESS=true; shift ;;
         --init)              ACTION="init"; shift ;;
         -h|--help)           usage ;;
         --)           shift; AFTER_DASHDASH=true; break ;;
@@ -252,6 +266,9 @@ done
 if ! $AFTER_DASHDASH; then
     TARGET_DIR="${1:-$PWD}"
     shift 2>/dev/null || true
+    # `codebox DIR -- ARGS`: the -- separates DIR from the agent's arguments
+    # and is not one of them.
+    [[ "${1:-}" != "--" ]] || shift
 fi
 TARGET_DIR="$(realpath "${TARGET_DIR:-$PWD}")"
 
@@ -1255,22 +1272,36 @@ if $USE_TAILSCALE; then
     NETWORK_ARGS=(--network "container:$TS_CONTAINER" -v "$TS_SOCKET_VOLUME:/var/run/tailscale")
 fi
 
+RUN_ARGS=(
+    --init
+    --name "$CONTAINER_NAME"
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --user "$(id -u):$(id -g)"
+    -v "$TARGET_DIR:$TARGET_DIR"
+    "${CRED_MOUNTS[@]}"
+    "${GITCONFIG_MOUNTS[@]}"
+    "${EXTRA_VOLUME_ARGS[@]}"
+    "${NETWORK_ARGS[@]}"
+    -w "$TARGET_DIR"
+    -e HOME=/home/sandbox
+    "${ENV_ARGS[@]}"
+)
+
 CONTAINER_STARTED=true
-docker run -d -it --init \
-    --name "$CONTAINER_NAME" \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --user "$(id -u):$(id -g)" \
-    -v "$TARGET_DIR:$TARGET_DIR" \
-    "${CRED_MOUNTS[@]}" \
-    "${GITCONFIG_MOUNTS[@]}" \
-    "${EXTRA_VOLUME_ARGS[@]}" \
-    "${NETWORK_ARGS[@]}" \
-    -w "$TARGET_DIR" \
-    -e HOME=/home/sandbox \
-    "${ENV_ARGS[@]}" \
-    "$RUN_IMAGE" \
-    "$@" >/dev/null
+
+# Headless: no tty, so none of the attach and Ctrl-Z machinery below. The
+# client stays in the foreground with stdin attached (-i), so piped input
+# reaches the agent, stdout and stderr stay separate, and docker run exits
+# with the agent's status. docker run forwards signals such as Ctrl-C to the
+# agent. The EXIT trap removes the container.
+if $HEADLESS; then
+    status=0
+    docker run -i "${RUN_ARGS[@]}" "$RUN_IMAGE" "$@" || status=$?
+    exit "$status"
+fi
+
+docker run -d -it "${RUN_ARGS[@]}" "$RUN_IMAGE" "$@" >/dev/null
 
 attach_once false
 

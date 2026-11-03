@@ -45,6 +45,7 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `--tailscale` | Put the container on your tailnet through a Tailscale sidecar container (see [Tailscale](#tailscale)) |
 | `--serve PORT` | With `--tailscale`, make `PORT` in the container reachable from the tailnet over HTTP on port 80 |
 | `--serve-https` | With `--serve`, use HTTPS on port 443 instead. The tailnet must have HTTPS certificates enabled |
+| `--headless` | Run without a terminal, for scripts (see [Headless mode](#headless-mode)) |
 | `--init` | Write a `Dockerfile.codebox` template into `DIR` |
 | `-h`, `--help` | Show help |
 
@@ -145,6 +146,30 @@ Ctrl-Z suspends the session and `fg` resumes it. The container keeps running whi
 Claude Code handles Ctrl-Z itself. The first press shows a notice that Ctrl-Z now suspends and Ctrl+_ undoes input. Press Ctrl-Z again to suspend. Claude Code shows this notice every time, and its keybindings have no setting to turn it off.
 
 When an agent does not handle Ctrl-Z itself, Docker's detach key catches it, and the first press suspends the session.
+
+## Headless mode
+
+`--headless` runs the container without a terminal, so you can use codebox from scripts, cron jobs and CI. codebox passes stdin to the agent, and the agent's output goes to stdout and stderr. codebox exits with the agent's exit status. Ctrl-Z job control is off in this mode.
+
+codebox adds no flags to the agent's command, so give the agent's own non-interactive command:
+
+```sh
+# Claude Code
+codebox --headless ~/src/myproject -- -p "Summarise the open TODOs"
+
+# Codex
+codebox --headless --codex ~/src/myproject -- exec "Summarise the open TODOs"
+
+# OpenCode
+codebox --headless --opencode ~/src/myproject -- run "Summarise the open TODOs"
+
+# Input from a pipe
+git diff | codebox --headless ~/src/myproject -- -p "Review this diff"
+```
+
+Nobody can answer permission prompts in headless mode. When a task needs to edit files or run commands, pass the agent's permission flags too, such as `--allowedTools` or `--dangerously-skip-permissions` for Claude Code.
+
+codebox cannot ask for confirmation without a terminal. Pass `--trust` for a project whose `Dockerfile.codebox` or `.env.codebox` you have not trusted yet, and `--allow-home` when `DIR` is your home directory.
 
 ## Project-specific images
 
