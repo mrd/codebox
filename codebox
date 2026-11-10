@@ -47,7 +47,7 @@
 #   --allow-home         Allow DIR or a --mount host path to be your home
 #                        directory (or an ancestor of it) without prompting;
 #                        this exposes everything under it
-#   --opencode           Use OpenCode (opencode.ai) instead of Claude Code
+#   --opencode           Use OpenCode 2 (opencode.ai) instead of Claude Code
 #   --codex              Use OpenAI Codex (chatgpt.com/codex) instead of Claude
 #   --polytoken          Use Polytoken (polytoken.dev) instead of Claude Code
 #   --tailscale         Put the container on your tailnet through a Tailscale
@@ -74,15 +74,17 @@
 #
 # Credential mounts (default):
 #   Claude Code: ~/.claude and ~/.claude.json mounted read-write.
-#   OpenCode:    ~/.config/opencode mounted read-write.
+#   OpenCode:    ~/.config/opencode and ~/.local/share/opencode (provider
+#                logins, sessions, logs) mounted read-write.
 #   Codex:       ~/.codex mounted read-write.
 #   Polytoken:   ~/.config/polytoken and ~/.local/share/polytoken (provider
 #                logins, sessions, logs) mounted read-write.
 #   With --no-credentials a dedicated sandbox config dir is mounted instead of
-#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox /
-#   ~/.codex-codebox / ~/.config/polytoken-codebox and
-#   ~/.local/share/polytoken-codebox), so no host login state, host-executed
-#   hooks, CLAUDE.md or memory are exposed. To authenticate in that case, log
+#   the host's real one (~/.claude-codebox / ~/.config/opencode-codebox and
+#   ~/.local/share/opencode-codebox / ~/.codex-codebox /
+#   ~/.config/polytoken-codebox and ~/.local/share/polytoken-codebox), so no
+#   host login state, host-executed hooks, CLAUDE.md or memory are exposed.
+#   To authenticate in that case, log
 #   in inside the container (the login is kept in the sandbox config dir), or
 #   set ANTHROPIC_API_KEY (OPENAI_API_KEY for Codex). For a Claude
 #   subscription without logging in, create a token on the host with
@@ -512,6 +514,13 @@ ENTRYPOINT ["claude"]
 DOCKERFILE
 fi
 
+# The container runs as the host user, so it cannot write to directories that
+# root created. OpenCode writes to ~/.config, ~/.cache, ~/.local/share and
+# ~/.local/state, so the image creates them world-writable. Otherwise a
+# Dockerfile.codebox that installs a tool into ~/.local/bin as root (e.g. uv),
+# or Docker creating the parents of the ~/.local/share/opencode mount, leaves
+# ~/.local owned by root and OpenCode fails with
+# "EACCES: permission denied, mkdir '/home/sandbox/.local/state'".
 if $USE_OPENCODE && { $REBUILD || ! docker image inspect "$BASE_IMAGE_NAME" &>/dev/null; }; then
     echo "Building $BASE_IMAGE_NAME..." >&2
     docker build "${CACHE_ARG[@]}" \
@@ -525,13 +534,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /home/sandbox \
-    && chmod 777 /home/sandbox
+    && mkdir -p /home/sandbox/.config /home/sandbox/.cache \
+        /home/sandbox/.local/share /home/sandbox/.local/state \
+    && chmod 777 /home/sandbox /home/sandbox/.config /home/sandbox/.cache \
+        /home/sandbox/.local /home/sandbox/.local/share /home/sandbox/.local/state
 
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
 
-RUN curl -fsSL https://opencode.ai/install | bash
+RUN curl -fsSL https://opencode.ai/v2/install | bash
 
 ENTRYPOINT ["opencode"]
 DOCKERFILE
@@ -627,13 +638,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /home/sandbox \
-    && chmod 777 /home/sandbox
+    && mkdir -p /home/sandbox/.config /home/sandbox/.cache \
+        /home/sandbox/.local/share /home/sandbox/.local/state \
+    && chmod 777 /home/sandbox /home/sandbox/.config /home/sandbox/.cache \
+        /home/sandbox/.local /home/sandbox/.local/share /home/sandbox/.local/state
 
 ENV HOME=/home/sandbox
 ENV PATH="/home/sandbox/.opencode/bin:/home/sandbox/.local/bin:$PATH"
 
-RUN curl -fsSL https://opencode.ai/install | bash
+RUN curl -fsSL https://opencode.ai/v2/install | bash
 
 ENTRYPOINT ["opencode"]
 DOCKERFILE
@@ -949,13 +962,19 @@ if $USE_CODEX; then
     CRED_MOUNTS=(-v "$CODEX_CONFIG_HOST_DIR:/home/sandbox/.codex-home")
     ENV_ARGS+=(-e "CODEX_HOME=/home/sandbox/.codex-home")
 elif $USE_OPENCODE; then
+    # OpenCode 2 keeps settings in the config dir, and provider logins (API
+    # keys, OAuth tokens) in a SQLite database in the data dir alongside
+    # sessions and logs, so both are mounted.
     if $NO_CREDS; then
         OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode-codebox"
+        OPENCODE_DATA_HOST_DIR="${HOME}/.local/share/opencode-codebox"
     else
         OPENCODE_CONFIG_HOST_DIR="${HOME}/.config/opencode"
+        OPENCODE_DATA_HOST_DIR="${HOME}/.local/share/opencode"
     fi
-    mkdir -p "$OPENCODE_CONFIG_HOST_DIR"
-    CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode")
+    mkdir -p "$OPENCODE_CONFIG_HOST_DIR" "$OPENCODE_DATA_HOST_DIR"
+    CRED_MOUNTS=(-v "$OPENCODE_CONFIG_HOST_DIR:/home/sandbox/.config/opencode"
+                 -v "$OPENCODE_DATA_HOST_DIR:/home/sandbox/.local/share/opencode")
 elif $USE_POLYTOKEN; then
     # Polytoken keeps its settings in the config dir, and provider logins
     # (OAuth tokens) in the data dir alongside sessions and logs, so both are

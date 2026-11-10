@@ -39,7 +39,7 @@ codebox [OPTIONS] [DIR] [-- ARGS...]
 | `--no-user-config` | Do not read the user-wide env file, `~/.config/codebox/env` |
 | `--trust` | Use the project's `Dockerfile.codebox` and `.env.codebox` without the trust prompt (needed when there is no terminal, e.g. in scripts) |
 | `--allow-home` | Skip the confirmation prompt when `DIR` or a `--mount` host path is your home directory or an ancestor of it |
-| `--opencode` | Use [OpenCode](https://opencode.ai) instead of Claude Code |
+| `--opencode` | Use [OpenCode 2](https://opencode.ai/v2/docs) instead of Claude Code |
 | `--codex` | Use [OpenAI Codex](https://chatgpt.com/codex) instead of Claude Code |
 | `--polytoken` | Use [Polytoken](https://polytoken.dev) instead of Claude Code |
 | `--tailscale` | Put the container on your tailnet through a Tailscale sidecar container (see [Tailscale](#tailscale)) |
@@ -129,7 +129,7 @@ By default codebox mounts your real config directory read-write, so that login s
 | Tool | Mounted | With `--no-credentials` |
 |------|---------|-------------------------|
 | Claude Code | `~/.claude` and `~/.claude.json` | `~/.claude-codebox` |
-| OpenCode | `~/.config/opencode` | `~/.config/opencode-codebox` |
+| OpenCode | `~/.config/opencode` and `~/.local/share/opencode` (provider logins, sessions and logs) | `~/.config/opencode-codebox` and `~/.local/share/opencode-codebox` |
 | Codex | `~/.codex` (via `CODEX_HOME`, so it does not hide the Codex binary) | `~/.codex-codebox` |
 | Polytoken | `~/.config/polytoken` and `~/.local/share/polytoken` (provider logins, sessions and logs) | `~/.config/polytoken-codebox` and `~/.local/share/polytoken-codebox` |
 
