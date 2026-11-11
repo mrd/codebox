@@ -363,24 +363,16 @@ if [[ "$ACTION" == "init" ]]; then
         echo "error: $DOCKERFILE already exists" >&2
         exit 1
     fi
-    if $USE_OPENCODE; then
-        FROM_LINE="FROM codebox-opencode"
-    elif $USE_CODEX; then
-        FROM_LINE="FROM codebox-codex"
-    elif $USE_POLYTOKEN; then
-        FROM_LINE="FROM codebox-polytoken"
-    else
-        FROM_LINE="FROM codebox"
-    fi
     cat > "$DOCKERFILE" <<DOCKERFILE
 # Dockerfile.codebox — project dependencies for codebox
 # ======================================================
 # Your coding agent (Claude/OpenCode) can edit or recreate this file to
 # pre-install system packages, language runtimes, and project deps.
 #
-# The FROM line below uses the codebox base image. You can replace it with
-# any Docker image (e.g. FROM ubuntu:24.04) and codebox will install the AI
-# tool on top automatically.
+# No FROM line is needed: codebox prepends one naming the right codebox base
+# image (codebox, codebox-opencode, codebox-codex or codebox-polytoken). To
+# start from another image instead, add a FROM line (e.g. FROM ubuntu:24.04)
+# and codebox will install the AI tool on top automatically.
 #
 # Container context:
 #   HOME = /home/sandbox
@@ -399,8 +391,6 @@ if [[ "$ACTION" == "init" ]]; then
 #   ARG USER_ID
 #   ARG GROUP_ID
 #   RUN chown -R \$USER_ID:\$GROUP_ID /opt/android-sdk
-
-${FROM_LINE}
 
 # Install system packages
 # RUN apt-get update && apt-get install -y --no-install-recommends \\
